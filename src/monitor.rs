@@ -18,12 +18,15 @@
 //! 才认定是服务失联。
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::{SinkExt, StreamExt};
+use if_addrs::{IfAddr, Ifv4Addr};
 use serde_json::json;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -201,6 +204,9 @@ async fn heartbeat_once(addr: &str) -> Result<Duration, String> {
 
         let pong = crypto::open_frame(&text).map_err(|e| format!("心跳应答解密失败: {e}"))?;
         if pong["type"] == "pong" && pong["nonce"] == nonce {
+            // 礼貌地发送 WebSocket Close 帧再断开，
+            // 避免服务端把每次心跳都当作“异常断开”记录
+            let _ = tx.close().await;
             return Ok(started.elapsed());
         }
         // 其它报文（例如设备主动推送的状态）直接忽略
@@ -218,51 +224,129 @@ async fn test(addr: &str) -> Result<String, String> {
     }
 }
 
-/// UDP 广播扫描局域网内的心跳服务端。
+/// UDP 扫描局域网内的心跳服务端（覆盖本机所有网卡，含虚拟网卡）。
 ///
-/// 广播 discover 报文到 255.255.255.255:8124，持有合法口令的设备会
-/// 单播回复 announce；无法解密的杂音报文一律忽略。
+/// 实现：枚举本机所有 IPv4 网卡（Windows 走 GetAdaptersAddresses，
+/// Hyper-V / WSL / VMware / VPN / Tailscale 等虚拟网卡同样会被读到），
+/// 为每块网卡单独开一个 socket **绑定到该网卡的 IP**，向该子网的
+/// 定向广播地址发送 discover —— 这样每一条网卡所在网段都会被扫到，
+/// 而不是像 255.255.255.255 那样只从默认路由网卡发出。
+///
+/// 持有合法口令的设备会单播回复 announce；无法解密的杂音报文一律忽略。
 async fn scan() -> Result<Vec<Device>, String> {
-    let sock = UdpSocket::bind("0.0.0.0:0")
+    // 枚举网卡（同步系统调用，放阻塞线程执行）
+    let ifaces = tokio::task::spawn_blocking(if_addrs::get_if_addrs)
         .await
-        .map_err(|e| format!("绑定 UDP 端口失败: {e}"))?;
-    sock.set_broadcast(true)
-        .map_err(|e| format!("开启广播失败: {e}"))?;
+        .map_err(|e| format!("枚举网卡任务失败: {e}"))?
+        .map_err(|e| format!("枚举网卡失败: {e}"))?;
 
     let discover = json!({ "type": "discover", "nonce": random_nonce() });
     let frame = crypto::seal_json(&discover);
     let deadline = Instant::now() + SCAN_DURATION;
-    // 按来源 IP 去重
-    let mut found: HashMap<String, Device> = HashMap::new();
-    let mut buf = [0u8; 2048];
 
-    while Instant::now() < deadline {
-        let _ = sock
-            .send_to(frame.as_bytes(), ("255.255.255.255", DISCOVERY_PORT))
-            .await;
+    // 应答汇总通道
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Device>();
 
-        // 在广播间隔窗口内收集应答
-        while let Ok(res) = tokio::time::timeout(SCAN_BROADCAST_INTERVAL, sock.recv_from(&mut buf)).await {
-            let (n, peer) = res.map_err(|e| format!("接收扫描应答失败: {e}"))?;
-            let Ok(reply) = crypto::open_frame(std::str::from_utf8(&buf[..n]).map_err(|e| e.to_string())?)
-            else {
-                // 无法解密的报文：不是我们的设备，忽略
-                continue;
-            };
-            if reply["type"] == "announce" {
-                let name = reply["name"].as_str().unwrap_or("heartbeat-server").to_string();
-                let ws_port = reply["ws_port"].as_u64().unwrap_or(protocol::WS_PORT as u64) as u16;
-                let ip = peer.ip().to_string();
-                found.insert(
-                    ip.clone(),
-                    Device {
-                        name,
-                        addr: format!("{ip}:{ws_port}"),
-                    },
-                );
+    // 为每块网卡派生一个扫描任务
+    let mut started = 0;
+    for iface in &ifaces {
+        let Ifv4Addr { ip, broadcast, .. } = match &iface.addr {
+            IfAddr::V4(v4) => v4,
+            IfAddr::V6(_) => continue, // 本协议只做 IPv4
+        };
+        // 无广播地址的网卡（如部分点对点 VPN）：退化为向该网卡 IP 所在
+        // 子网的广播地址兜底，若拿不到则跳过
+        let Some(broadcast) = broadcast else { continue };
+        if broadcast.is_loopback() || broadcast.is_unspecified() {
+            continue;
+        }
+
+        // socket 绑定到该网卡 IP，确保广播从这块网卡发出
+        let Ok(sock) = UdpSocket::bind((*ip, 0)).await else {
+            continue; // 个别虚拟网卡可能不允许绑定，跳过即可
+        };
+        if sock.set_broadcast(true).is_err() {
+            continue;
+        }
+
+        let reply_tx = reply_tx.clone();
+        let frame = frame.clone();
+        let dst = SocketAddr::from((*broadcast, DISCOVERY_PORT));
+        started += 1;
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while Instant::now() < deadline {
+                if sock.send_to(frame.as_bytes(), dst).await.is_err() {
+                    return; // 这块网卡发不出去，放弃
+                }
+                // 每轮广播后监听一个窗口
+                if let Ok(Ok((n, peer))) =
+                    tokio::time::timeout(SCAN_BROADCAST_INTERVAL, sock.recv_from(&mut buf)).await
+                {
+                    if let Some(device) = decode_announce(&buf[..n], &peer) {
+                        let _ = reply_tx.send(device);
+                    }
+                }
             }
+        });
+    }
+
+    // 回环兜底：本机模拟服务端（127.0.0.1）也纳入扫描，方便联调
+    if let Ok(sock) = UdpSocket::bind(("127.0.0.1", 0)).await {
+        let reply_tx = reply_tx.clone();
+        let frame = frame;
+        let dst = SocketAddr::from(([127, 0, 0, 1], DISCOVERY_PORT));
+        started += 1;
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while Instant::now() < deadline {
+                if sock.send_to(frame.as_bytes(), dst).await.is_err() {
+                    return;
+                }
+                if let Ok(Ok((n, peer))) =
+                    tokio::time::timeout(SCAN_BROADCAST_INTERVAL, sock.recv_from(&mut buf)).await
+                {
+                    if let Some(device) = decode_announce(&buf[..n], &peer) {
+                        let _ = reply_tx.send(device);
+                    }
+                }
+            }
+        });
+    }
+
+    if started == 0 {
+        return Err("未找到可发起扫描的网卡（没有可用的 IPv4 广播地址）".into());
+    }
+    drop(reply_tx);
+
+    // 等到截止时间，汇总去重（按来源 IP）
+    let mut found: HashMap<String, Device> = HashMap::new();
+    while Instant::now() < deadline {
+        match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), reply_rx.recv())
+            .await
+        {
+            Ok(Some(device)) => {
+                found.insert(device.addr.clone(), device);
+            }
+            // 所有扫描任务已结束且通道关闭，或超时
+            _ => break,
         }
     }
 
     Ok(found.into_values().collect())
+}
+
+/// 解码一条 announce 应答；解不开（不是我们的设备）返回 None
+fn decode_announce(data: &[u8], peer: &SocketAddr) -> Option<Device> {
+    let reply = crypto::open_frame(std::str::from_utf8(data).ok()?).ok()?;
+    if reply["type"] != "announce" {
+        return None;
+    }
+    let name = reply["name"].as_str().unwrap_or("heartbeat-server").to_string();
+    let ws_port = reply["ws_port"].as_u64().unwrap_or(protocol::WS_PORT as u64) as u16;
+    let ip = peer.ip().to_string();
+    Some(Device {
+        name,
+        addr: format!("{ip}:{ws_port}"),
+    })
 }

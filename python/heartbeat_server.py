@@ -64,16 +64,18 @@ def in_outage() -> bool:
 # ---------------------------------------------------------------------------
 
 async def handle_ws(ws) -> None:
-    """一个 PC 客户端连接的生命周期"""
-    peer = ws.remote_address
-    log(f"WebSocket 连接进入: {peer}")
+    """一个 PC 客户端连接的生命周期。
+
+    心跳是“连上 -> ping -> pong -> 正常关闭”的短连接（约 3 秒一次），
+    因此这里不做连接级别的日志，只记录真正的异常与非法报文。
+    """
     try:
         async for raw in ws:
             # ---- 解密 ----
             try:
                 msg = protocol.open_frame(raw if isinstance(raw, str) else raw.decode("utf-8"))
             except ValueError as e:
-                log(f"  非法报文（已丢弃）: {e}")
+                log(f"非法报文（已丢弃）: {e}")
                 continue
 
             mtype = msg.get("type")
@@ -82,13 +84,12 @@ async def handle_ws(ws) -> None:
                 pong = {"type": "pong", "nonce": msg.get("nonce"), "uptime_s": uptime()}
                 await ws.send(protocol.seal(pong))
             elif mtype == "ping" and in_outage():
-                log("  [模拟断电中] 收到 ping，假装不在……")
+                log("[模拟断电中] 收到 ping，假装不在……")
             else:
-                log(f"  收到未知类型报文: {mtype}")
+                log(f"收到未知类型报文: {mtype}")
     except Exception as e:
-        log(f"WebSocket 连接异常断开: {peer} ({e})")
-    finally:
-        log(f"WebSocket 连接结束: {peer}")
+        # 客户端正常关闭时 async for 会自然结束，走到这里说明是真的异常
+        log(f"WebSocket 连接异常: {type(e).__name__}: {e}")
 
 
 async def run_ws_server(port: int) -> None:
@@ -109,6 +110,7 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
     def __init__(self, name: str, ws_port: int):
         self.name = name
         self.ws_port = ws_port
+        self._last_log: dict = {}  # 按来源地址去重日志（一次扫描会广播多次）
 
     def connection_made(self, transport) -> None:
         self.transport = transport
@@ -129,7 +131,10 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
             "uptime_s": uptime(),
         }
         self.transport.sendto(protocol.seal(announce).encode("ascii"), addr)
-        log(f"UDP 发现应答 -> {addr[0]}:{addr[1]} (name={self.name})")
+        now = time.monotonic()
+        if now - self._last_log.get(addr, 0) > 1.0:
+            self._last_log[addr] = now
+            log(f"UDP 发现应答 -> {addr[0]}:{addr[1]} (name={self.name})")
 
 
 async def run_udp_server(port: int, name: str, ws_port: int) -> None:

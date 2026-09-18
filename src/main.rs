@@ -17,6 +17,11 @@
 //! - [`win32`]    原生窗口辅助（隐藏 / 恢复 / 拦截最小化）
 //! - [`countdown`] 关机倒计时弹窗
 //! - [`app`]      主界面与事件主控
+//!
+//! release 构建下标记为纯 GUI 程序，启动时不再弹出控制台黑框；
+//! debug 构建保留控制台以便查看日志输出。
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod countdown;
@@ -38,6 +43,11 @@ use app::{AppModel, MAIN_WINDOW_TITLE};
 use events::{AppEvent, MonitorCommand};
 
 fn main() {
+    // 单实例保护：已有实例运行时，把它的主窗口恢复置前，然后直接退出
+    if !win32::ensure_single_instance(MAIN_WINDOW_TITLE) {
+        return;
+    }
+
     // 事件通道：所有后台来源（托盘 / 心跳线程 / 倒计时弹窗）统一发到这里，
     // 由 UI 主循环串行处理，避免多线程同时操作 UI 状态。
     let (event_tx, mut event_rx) = futures::channel::mpsc::unbounded::<AppEvent>();
@@ -48,6 +58,9 @@ fn main() {
     app.run(move |cx| {
         gpui_kit::init(cx);
 
+        // 注册事件发送端（win32 子类化过程需要用它通知“窗口已隐藏”）
+        win32::set_event_tx(event_tx.clone());
+
         // 创建系统托盘（必须在主线程）
         tray::create_tray(event_tx.clone());
 
@@ -55,7 +68,7 @@ fn main() {
         monitor::spawn(cmd_rx, event_tx.clone());
 
         cx.spawn(async move |cx| {
-            // 计算主窗口初始位置（屏幕居中）
+            // 计算主窗口初始位置（屏幕居中，高度与最小高度一致，紧凑显示）
             let bounds = cx.update(|cx| WindowBounds::centered(size(px(560.), px(430.)), cx));
 
             // AppModel 实体通过槽位从窗口构建闭包里带出来：
@@ -66,7 +79,8 @@ fn main() {
 
             let main_window = cx
                 .open_window(main_window_options(Some(bounds)), |window, cx| {
-                    let model = cx.new(|cx| AppModel::new(event_tx.clone(), cmd_tx.clone(), window, cx));
+                    let model =
+                        cx.new(|cx| AppModel::new(event_tx.clone(), cmd_tx.clone(), window, cx));
                     *slot_for_closure.borrow_mut() = Some(model.clone());
                     // 第一层视图必须是 Root
                     let view: gpui_kit::AnyView = model.into();

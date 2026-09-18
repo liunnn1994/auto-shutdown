@@ -52,6 +52,8 @@ pub enum AppEvent {
     TrayShow,
     /// 托盘菜单：退出程序
     Quit,
+    /// 主窗口已隐藏到托盘（最小化或关闭按钮触发），UI 可借此清理临时状态
+    WindowHidden,
     /// 倒计时结束 / 用户点击“立即关机”
     ShutdownNow,
     /// 用户在倒计时弹窗上做出的选择

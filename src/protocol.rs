@@ -53,8 +53,6 @@ pub const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 pub const COUNTDOWN_SECONDS: u64 = 60;
 /// “稍后关机”的重新弹出间隔（秒）
 pub const SNOOZE_LATER_SECONDS: u64 = 30;
-/// “取消关机”的重新弹出间隔（秒）
-pub const SNOOZE_CANCEL_SECONDS: u64 = 60;
 
 /// 预共享口令。两端（PC 与服务端）必须配置完全一致的内容。
 /// 如需更换，请同步修改 python/protocol.py 与服务端代码。

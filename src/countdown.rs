@@ -2,21 +2,26 @@
 //!
 //! 心跳服务失联（心跳丢失超过 60 秒）时弹出的**置顶**独立窗口：
 //!
-//! - 一个不断刷新的 60 秒倒计时，归零后自动关机；
-//! - 三个按钮：
+//! - 一个不断刷新的 60 秒倒计时（`ProgressCircle` 环形进度 + 剩余秒数）；
+//! - 三个标准 `Button`：
 //!   - **立即关机**：马上执行关机命令；
-//!   - **取消关机**：关闭弹窗，60 秒后若服务仍未恢复则再次弹出；
+//!   - **取消关机**：关闭弹窗，心跳恢复后重新开始监测；
 //!   - **稍后关机 (30s)**：关闭弹窗，30 秒后再次弹出完整倒计时。
 //! - 若倒计时期间服务恢复（心跳恢复），主控逻辑会直接关闭本弹窗。
 //!
 //! 窗口使用 `WindowKind::PopUp`，在 Windows 上对应 `WS_EX_TOPMOST`，
 //! 始终悬浮在所有普通窗口之上。
+//!
+//! 注意：内容直接用组件库组件布局，不走 `Dialog` overlay ——
+//! PopUp 窗口里 overlay 的渲染不可靠（曾出现过整窗空白）。
 
 use std::time::Duration;
 
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Root};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::progress::ProgressCircle;
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Root, Sizable as _, Size};
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Context, FontWeight, ParentElement as _, Render, Styled as _, Window,
@@ -29,7 +34,7 @@ use crate::protocol::COUNTDOWN_SECONDS;
 /// 倒计时窗口标题（也用于 Win32 查找窗口句柄，必须唯一）
 pub const COUNTDOWN_TITLE: &str = "自动关机守护 - 关机倒计时警告";
 /// 倒计时窗口尺寸
-const WINDOW_SIZE: (f32, f32) = (480., 320.);
+const WINDOW_SIZE: (f32, f32) = (520., 360.);
 
 pub struct CountdownView {
     /// 剩余秒数（每秒 -1，归零触发关机）
@@ -72,8 +77,10 @@ impl Render for CountdownView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui_kit::IntoElement {
         let theme = cx.theme();
         let danger = theme.danger;
+        let muted = theme.muted_foreground;
+        let pct = self.remaining as f32 / COUNTDOWN_SECONDS as f32 * 100.;
 
-        // 各按钮共用的事件发送端（闭包需要按值捕获，逐个克隆）
+        // 各按钮共用的事件发送端（闭包按值捕获，逐个克隆）
         let tx_shutdown = self.events.clone();
         let tx_cancel = self.events.clone();
         let tx_later = self.events.clone();
@@ -83,55 +90,52 @@ impl Render for CountdownView {
             .items_center()
             .justify_center()
             .bg(theme.background)
+            .text_color(theme.foreground)
             .child(
                 v_flex()
-                    .w(px(WINDOW_SIZE.0 - 40.))
-                    .p_5()
-                    .gap_3()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(danger)
-                    .bg(theme.secondary)
+                    .gap_4()
+                    .items_center()
                     // ---- 标题 ----
                     .child(
                         h_flex()
-                            .items_center()
                             .gap_2()
-                            .child(Icon::new(IconName::TriangleAlert).text_color(danger))
+                            .items_center()
+                            .child(Icon::new(IconName::TriangleAlert).large().text_color(danger))
                             .child(
-                                div()
-                                    .text_size(px(18.))
+                                Label::new("心跳失联警告")
+                                    .text_size(px(20.))
                                     .font_weight(FontWeight::BOLD)
-                                    .text_color(danger)
-                                    .child("心跳失联警告"),
+                                    .text_color(danger),
                             ),
                     )
                     // ---- 说明 ----
                     .child(
-                        div()
-                            .text_size(px(13.))
-                            .text_color(theme.muted_foreground)
-                            .child("心跳服务已失联超过 60 秒，服务端可能已断电或离线。"),
+                        v_flex().gap_1().items_center().child(
+                            Label::new("心跳服务已失联超过 60 秒，服务端可能已断电或离线。")
+                                .text_color(muted),
+                        ),
                     )
-                    // ---- 倒计时 ----
+                    // ---- 环形倒计时 ----
                     .child(
-                        div()
-                            .text_size(px(30.))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(danger)
-                            .child(format!("{} 秒后将自动关机", self.remaining)),
+                        ProgressCircle::new("countdown")
+                            .with_size(Size::Size(px(128.)))
+                            .color(danger)
+                            .value(pct)
+                            .child(
+                                v_flex().items_center().child(
+                                    div()
+                                        .text_size(px(40.))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(danger)
+                                        .child(format!("{}", self.remaining)),
+                                ),
+                            ),
                     )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(theme.muted_foreground)
-                            .child("若服务已恢复，心跳恢复后本窗口会自动关闭。"),
-                    )
+                    .child(Label::new("秒后自动关机").text_color(muted))
                     // ---- 按钮组 ----
                     .child(
                         h_flex()
                             .mt_2()
-                            .justify_center()
                             .gap_2()
                             .child(
                                 Button::new("shutdown")
@@ -143,10 +147,11 @@ impl Render for CountdownView {
                             )
                             .child(
                                 Button::new("cancel")
+                                    .ghost()
                                     .label("取消关机")
                                     .on_click(move |_, _, _| {
-                                        let _ =
-                                            tx_cancel.unbounded_send(AppEvent::CountdownAction(CountdownChoice::Cancel));
+                                        let _ = tx_cancel
+                                            .unbounded_send(AppEvent::CountdownAction(CountdownChoice::Cancel));
                                     }),
                             )
                             .child(
@@ -154,8 +159,8 @@ impl Render for CountdownView {
                                     .secondary()
                                     .label("稍后关机 (30s)")
                                     .on_click(move |_, _, _| {
-                                        let _ =
-                                            tx_later.unbounded_send(AppEvent::CountdownAction(CountdownChoice::Later));
+                                        let _ = tx_later
+                                            .unbounded_send(AppEvent::CountdownAction(CountdownChoice::Later));
                                     }),
                             ),
                     ),
@@ -187,9 +192,9 @@ pub fn open_countdown_window(
         ..Default::default()
     };
 
-        cx.open_window(options, |window, cx| {
-            let view: gpui_kit::AnyView = cx.new(|cx| CountdownView::new(events, window, cx)).into();
-            cx.new(|cx| Root::new(view, window, cx))
-        })
-        .expect("打开倒计时窗口失败")
+    cx.open_window(options, |window, cx| {
+        let view: gpui_kit::AnyView = cx.new(|cx| CountdownView::new(events, window, cx)).into();
+        cx.new(|cx| Root::new(view, window, cx))
+    })
+    .expect("打开倒计时窗口失败")
 }
