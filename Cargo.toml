@@ -18,4 +18,16 @@ sha2 = "0.11.0"
 base64 = "0.23.1"
 rand = "0.10.2"
 tray-icon = "0.25.1"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
+if-addrs = "0.15.0"
+
+[build-dependencies]
+winresource = "0.1"
+
+# release 加固：去符号 + 全程序优化，提高逆向门槛、缩小体积
+[profile.release]
+strip = "symbols"      # 剥离符号表与调试信息，函数/变量名不再暴露
+lto = true             # 全程序链接时优化，大量函数被内联，还原逻辑更难
+codegen-units = 1      # 单编译单元，跨函数优化更彻底（编译稍慢）
+opt-level = "z"        # 优化目标改为体积（本程序无计算热点，UI 性能无感）
+panic = "abort"        # panic 直接退出，不再链接栈展开代码
