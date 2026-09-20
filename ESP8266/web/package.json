@@ -1,0 +1,20 @@
+{
+  "name": "auto-shutdown-esp8266-web",
+  "private": true,
+  "type": "module",
+  "description": "ESP8266 固件 Web 界面（Vite 构建：Tailwind+daisyUI 按需 CSS + htmx 打包 → 单文件 HTML → 生成 htmx_min.h）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "htmx.org": "^4.0.0"
+  },
+  "devDependencies": {
+    "@minify-html/node": "^0.18.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "daisyui": "^5.7.42",
+    "tailwindcss": "^4.3.3",
+    "vite": "^8.3.0"
+  }
+}

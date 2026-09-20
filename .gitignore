@@ -1,2 +1,4 @@
 /target
 python/__pycache__
+node_modules
+ESP8266/web/dist

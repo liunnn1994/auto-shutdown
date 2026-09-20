@@ -1,0 +1,337 @@
+<!--
+  固件 Web 界面唯一源文件（Vite 8 构建，Tailwind v4 + daisyUI 5）。
+
+  本文件中的分片标记注释：@head / @login / @main / @tail（勿删勿改名），
+  构建时 CSS/JS 会内联进 @head 段，最终生成 ../htmx_min.h 供固件引用。
+  注意：说明性文字里不要出现形如"尖括号+!--"的注释写法，HTML 注释不能嵌套。
+
+  用法：
+      pnpm install
+      pnpm build   # 生成 ../htmx_min.h，再用 Arduino IDE 重新上传
+      pnpm dev     # 本地起 dev server 预览界面（无固件后端，接口请求返回 404）
+
+  说明：
+  1. main 段的 __SSID__ 占位符由固件替换为当前 WiFi 名称；__USER__ 替换为
+     管理员用户名；
+  2. 固件 .ino 里的 htmx 片段（状态卡片 / 扫描列表 / 提示）用到的 daisyUI
+     类列在 src/style.css 的 @source inline("...") 安全清单里，新增类时
+     记得同步加进去；
+  3. WiFi 选择：tabs 单选切换"扫描选择（select）"和"手动输入（input）"，
+     两者都通过 src/main.js 同步到表单隐藏域 #ssid 后提交；
+  4. #busy 是全局忙指示器（htmx-indicator 机制）：只有声明了
+     hx-indicator="#busy" 的请求（扫描 / 保存连接）才会显示它，
+     状态轮询不受影响；#login-busy 是登录表单提交时的全屏 loading。
+  5. 布局：#page 为 100dvh 的 flex 列，navbar 固定高度（shrink-0），
+     main 内容区 flex-grow:1 且内部滚动（配网窗口会拦截 document 级滚动，
+     滚动必须发生在页面内部容器上，详见 src/style.css 的注释）。
+-->
+<!-- @head -->
+<!doctype html>
+<html lang="zh" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>auto-shutdown 设备设置</title>
+    <!-- 兼容配网窗口等老 WebView：禁用 htmx 运行时注入样式
+         （其实现依赖 CSSStyleSheet/adoptedStyleSheets，老内核会抛异常导致
+         .htmx-indicator 隐藏规则缺失、#busy 遮罩挡死页面），
+         指示器样式改由 src/style.css 提供 -->
+    <meta name="htmx-config" content='{"includeIndicatorCSS": false}' />
+    <script type="module" src="/src/main.js"></script>
+  </head>
+  <body class="bg-base-200">
+    <div id="page" class="flex flex-col overflow-hidden">
+      <!-- @login -->
+      <div class="navbar bg-base-100 shadow-sm shrink-0">
+        <div class="mx-auto max-w-md w-full px-4 flex items-center gap-2">
+          <span class="text-xl" aria-hidden="true">📡</span>
+          <span class="font-bold text-lg">auto-shutdown</span>
+          <span class="badge badge-ghost badge-sm">心跳服务端</span>
+        </div>
+      </div>
+
+      <main
+        class="flex-1 min-h-0 overflow-y-auto mx-auto w-full max-w-md px-4 pt-5 pb-6"
+      >
+        <div class="card bg-base-100 shadow-lg">
+          <div class="card-body gap-4">
+            <h1 class="card-title">🔐 管理员登录</h1>
+            <form
+              id="login-form"
+              method="post"
+              action="/login"
+              class="flex flex-col gap-3"
+            >
+              <fieldset class="fieldset">
+                <legend class="fieldset-legend">用户名</legend>
+                <input
+                  name="user"
+                  class="input w-full"
+                  placeholder="用户名"
+                  autocomplete="username"
+                  required
+                />
+              </fieldset>
+              <fieldset class="fieldset">
+                <legend class="fieldset-legend">密码</legend>
+                <input
+                  name="pass"
+                  type="password"
+                  class="input w-full"
+                  placeholder="密码"
+                  autocomplete="current-password"
+                  required
+                />
+              </fieldset>
+              <button class="btn btn-primary">登录</button>
+            </form>
+          </div>
+        </div>
+      </main>
+      <script>
+        document.querySelector("input[name=user]")?.focus();
+      </script>
+
+      <!-- 登录提交时的全屏 loading（提交成功会整页跳转，失败则刷新后消失） -->
+      <div
+        id="login-busy"
+        class="fixed inset-0 z-50 items-center justify-center bg-black/40"
+        style="display: none"
+      >
+        <div class="card bg-base-100 shadow-xl">
+          <div class="card-body py-5 flex-row items-center gap-3">
+            <span class="loading loading-spinner loading-md"></span>
+            <span class="text-sm">登录中…</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- @main -->
+      <div class="navbar bg-base-100 shadow-sm shrink-0">
+        <div class="mx-auto max-w-md w-full px-4 flex items-center gap-2">
+          <span class="text-xl" aria-hidden="true">📡</span>
+          <span class="font-bold text-lg">auto-shutdown</span>
+          <span class="badge badge-ghost badge-sm hidden sm:inline-flex"
+            >心跳服务端</span
+          >
+          <div class="dropdown dropdown-end ml-auto">
+            <div tabindex="0" role="button" class="btn btn-ghost btn-sm">
+              👤 <span>__USER__</span> <span class="text-xs opacity-60">▾</span>
+            </div>
+            <ul
+              tabindex="0"
+              class="dropdown-content menu bg-base-100 rounded-box z-50 w-44 p-2 shadow-lg"
+            >
+              <li><button type="button" id="menu-pw">🔑 修改密码</button></li>
+              <li>
+                <form method="post" action="/logout" class="w-full">
+                  <button type="submit" class="w-full text-left text-error">
+                    🚪 退出登录
+                  </button>
+                </form>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <main
+        class="flex-1 min-h-0 overflow-y-auto mx-auto w-full max-w-md lg:max-w-4xl px-4 pt-5 pb-6 flex flex-col gap-4"
+      >
+        <div class="card bg-base-100 shadow">
+          <div
+            class="card-body gap-2"
+            id="status"
+            hx-get="/status"
+            hx-trigger="load, every 2s"
+          >
+            加载中…
+          </div>
+        </div>
+
+        <div class="grid gap-4 lg:grid-cols-2 items-start">
+          <div class="card bg-base-100 shadow">
+            <div class="card-body gap-4">
+              <h2 class="card-title text-base">📶 WiFi 连接</h2>
+
+              <div role="tablist" class="tabs tabs-box">
+                <input
+                  type="radio"
+                  name="wifi_mode"
+                  role="tab"
+                  class="tab"
+                  aria-label="扫描选择"
+                  checked
+                />
+                <div
+                  class="tab-content border-base-300 bg-base-100 p-3 w-full flex flex-col gap-2"
+                  id="scan-area"
+                >
+                  <button
+                    type="button"
+                    class="btn btn-outline btn-sm"
+                    hx-get="/scan"
+                    hx-target="#scan-area"
+                    hx-swap="innerHTML"
+                    hx-indicator="#busy"
+                    hx-disable="this"
+                  >
+                    🔍 扫描附近 WiFi
+                  </button>
+                  <select id="wifi-select" class="select w-full" disabled>
+                    <option>点击上方按钮获取网络列表</option>
+                  </select>
+                </div>
+
+                <input
+                  type="radio"
+                  name="wifi_mode"
+                  role="tab"
+                  class="tab"
+                  aria-label="手动输入"
+                />
+                <div class="tab-content border-base-300 bg-base-100 p-3 w-full">
+                  <input
+                    id="wifi-manual"
+                    type="text"
+                    class="input w-full"
+                    placeholder="输入 SSID（隐藏网络请用此项）"
+                    maxlength="32"
+                    autocomplete="off"
+                  />
+                </div>
+              </div>
+
+              <form
+                hx-post="/wifi"
+                hx-target="#wifi-result"
+                hx-swap="innerHTML"
+                hx-indicator="#busy"
+                class="flex flex-col gap-3"
+              >
+                <input type="hidden" name="ssid" id="ssid" value="__SSID__" />
+                <p id="ssid-hint" class="text-xs opacity-60 hidden"></p>
+                <fieldset class="fieldset">
+                  <legend class="fieldset-legend">
+                    WiFi 密码（开放网络可留空）
+                  </legend>
+                  <input
+                    id="pass"
+                    name="pass"
+                    type="password"
+                    class="input w-full"
+                    autocomplete="new-password"
+                  />
+                </fieldset>
+                <button class="btn btn-primary">保存并连接</button>
+              </form>
+              <div id="wifi-result"></div>
+            </div>
+          </div>
+
+          <div class="flex flex-col gap-4">
+            <div class="card bg-base-100 shadow">
+              <div class="card-body gap-4">
+                <h2 class="card-title text-base">ℹ️ 设备信息</h2>
+                <div class="text-sm flex flex-col gap-1">
+                  <p>
+                    设备名：<code class="bg-base-200 px-1 rounded"
+                      >heartbeat-server</code
+                    >
+                  </p>
+                  <p>
+                    Web 管理：<code class="bg-base-200 px-1 rounded">80</code>
+                    · 心跳 WS：<code class="bg-base-200 px-1 rounded">8123</code>
+                    · UDP 发现：<code class="bg-base-200 px-1 rounded"
+                      >8124</code
+                    >
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 全局忙指示器：仅带 hx-indicator="#busy" 的请求（扫描/保存连接）会显示 -->
+        <div
+          id="busy"
+          class="htmx-indicator fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+        >
+          <div class="card bg-base-100 shadow-xl">
+            <div class="card-body py-5 flex-row items-center gap-3">
+              <span class="loading loading-spinner loading-md"></span>
+              <span class="text-sm">处理中，请稍候…</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 修改密码弹窗（daisyUI modal） -->
+        <dialog id="pw-modal" class="modal">
+          <div class="modal-box max-w-sm">
+            <h3 class="text-lg font-bold">🔑 修改管理员密码</h3>
+            <p class="text-sm opacity-60 mt-1">
+              修改成功后将自动退出，需用新密码重新登录
+            </p>
+            <form
+              id="pw-form"
+              hx-post="/password"
+              hx-target="#pw-result"
+              hx-swap="innerHTML"
+              class="flex flex-col gap-3 mt-4"
+            >
+              <fieldset class="fieldset">
+                <legend class="fieldset-legend">当前密码</legend>
+                <input
+                  name="old"
+                  type="password"
+                  class="input w-full"
+                  autocomplete="current-password"
+                  autofocus
+                  required
+                />
+              </fieldset>
+              <fieldset class="fieldset">
+                <legend class="fieldset-legend">新密码（至少 8 位）</legend>
+                <input
+                  id="pw-new"
+                  name="pass"
+                  type="password"
+                  class="input w-full"
+                  minlength="8"
+                  autocomplete="new-password"
+                  required
+                />
+              </fieldset>
+              <fieldset class="fieldset">
+                <legend class="fieldset-legend">确认新密码</legend>
+                <input
+                  id="pw-confirm"
+                  type="password"
+                  class="input w-full"
+                  autocomplete="new-password"
+                  required
+                />
+              </fieldset>
+              <p id="pw-match-err" class="hidden text-sm text-error">
+                两次输入的新密码不一致
+              </p>
+              <div id="pw-result"></div>
+              <div class="flex justify-end gap-2">
+                <button type="button" id="pw-cancel" class="btn btn-ghost">
+                  取消
+                </button>
+                <button id="pw-save" class="btn btn-primary">保存</button>
+              </div>
+            </form>
+          </div>
+          <form method="dialog" class="modal-backdrop">
+            <button>关闭</button>
+          </form>
+        </dialog>
+      </main>
+
+      <!-- @tail -->
+    </div>
+    <p class="shrink-0 text-center text-xs opacity-50 py-2">auto-shutdown</p>
+  </body>
+</html>

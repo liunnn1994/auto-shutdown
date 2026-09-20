@@ -52,9 +52,15 @@ python heartbeat_server.py --outage 30     # 启动 30 秒后"模拟断电"60 �
 PC 端启动后会自动扫描到本机运行的模拟服务端（同机广播即可收到）；
 也可以手动输入 `127.0.0.1:8123` 后点"测试"。
 
-### 3. 把服务端逻辑部署到真实设备（如 ESP32）
+### 3. 部署到真实设备
 
-`python/heartbeat_server.py` 就是服务端需要实现的全部行为的参考实现：
+**ESP8266（NodeMCU）**：仓库已附带可直接烧录的完整实现，见
+[`ESP8266/README.md`](ESP8266/README.md)（仅需一块 NodeMCU ESP8266 开发板；
+首次上电自动开配置热点，浏览器登录管理员账号即可配置 WiFi，带 htmx Web
+管理界面，配置掉电保存）。
+
+**其他设备（如 ESP32）**：`python/heartbeat_server.py` 就是服务端需要实现的
+全部行为的参考实现：
 
 1. WebSocket 服务端（端口 8123）：收到加密 `ping` → 回加密 `pong`（原样带回 nonce）；
 2. UDP 服务端（端口 8124）：收到加密 `discover` → 向来源单播加密 `announce`；
@@ -160,6 +166,11 @@ python/
 ├── protocol.py         加密协议实现（服务端移植参考）
 ├── heartbeat_server.py 心跳服务端模拟（支持 --outage 断电模拟）
 └── requirements.txt
+ESP8266/
+├── ESP8266.ino         NodeMCU(ESP8266) 心跳服务端完整实现（Arduino IDE 直接上传）
+├── htmx_min.h          Web 界面自动生成产物（勿手改，由 web/ Vite 构建生成）
+├── web/                Web 管理界面 Vite 项目（Tailwind + daisyUI + htmx）
+└── README.md           配置、烧录与验证说明
 ```
 
 ## 常见问题

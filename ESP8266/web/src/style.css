@@ -1,0 +1,70 @@
+/* Tailwind v4 + daisyUI 5 入口样式（由 main.js 引入，Vite 构建时按需生成 CSS） */
+
+@import "tailwindcss";
+
+@plugin "daisyui" {
+  themes: light --default;
+}
+
+/* 安全清单：固件 .ino 里的 htmx 片段（状态卡片 / 扫描列表 / 提示信息）用到的
+ * daisyUI / Tailwind 类不在本目录任何源码里，靠这里显式保留，避免被按需
+ * 构建裁掉。在固件片段里新增样式类时，记得同步加进这条指令。 */
+@source inline("alert alert-error alert-success alert-warning alert-info badge badge-sm badge-success badge-error badge-warning badge-ghost loading loading-spinner loading-sm progress progress-primary btn btn-outline btn-sm select select-bordered w-full flex items-center gap-1 gap-2 text-sm text-xs text-error py-2 py-4 code bg-base-200 px-1 rounded mt-2 hidden");
+
+/* htmx 请求指示器样式：自己提供而非依赖 htmx 运行时注入
+ * （htmx 的注入用 CSSStyleSheet/adoptedStyleSheets，老 WebView 不支持） */
+.htmx-indicator {
+  opacity: 0;
+  visibility: hidden;
+}
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 200ms ease-in;
+}
+
+/* 修复页面无法滚动：daisyUI 5 的滚动锁实现是
+ *   :root { --page-overflow: var(--page-scroll-lock) hidden }
+ *   :root:not(span) { overflow: var(--page-overflow) }
+ * 即 html { overflow: initial hidden }。"initial" 混入简写在规范上非法，
+ * Chrome 会丢弃整条声明（页面正常滚动），但部分内核（如配网 WebView）
+ * 会接受它，使 html 的 overflow-y 变成 hidden，页面完全无法滚动。
+ * 这里用未分层样式（优先级高于 daisyUI 的 @layer）显式恢复滚动，
+ * 弹窗打开时的滚动锁用 :has 单独保留。 */
+html {
+  overflow-y: auto;
+}
+html:has(.modal[open]) {
+  overflow-y: hidden;
+}
+
+/* 布局（配网窗口兼容）：
+ * - #page 为 100dvh 的 flex 列：header 固定高度（shrink-0），
+ *   内容区 main 为 flex-grow:1 且内部滚动（min-height:0 允许收缩）；
+ * - 滚动必须发生在页面内部容器上：系统的配网窗口外层包了下拉刷新容器，
+ *   会拦截 document 级滚动手势（下拉变成刷新整个页面）；
+ * - body 比视口高 2px，配合 main.js 把 document 钉在 scrollTop=1，
+ *   让系统永远判定"页面可以向上滚"，不再抢走下拉手势。 */
+html,
+body {
+  height: 100%;
+}
+body {
+  height: calc(100% + 2px);
+  overflow: hidden;
+}
+#page {
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#page > main {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}

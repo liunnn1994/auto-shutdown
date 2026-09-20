@@ -1,2 +1,5 @@
 [tools]
 rust = "1.97.1"
+node = "26.7.0"
+# Node 26 不再内置 Corepack，由 mise 直接安装并固定 pnpm。使用 npm 后端安装，规避 Linux 下 aqua 资产匹配失败问题
+pnpm = { version = "12.4.1", backend = "npm" }
