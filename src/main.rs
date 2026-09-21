@@ -18,6 +18,7 @@
 //! - [`win32`]    原生窗口辅助（隐藏 / 恢复 / 拦截最小化）
 //! - [`countdown`] 关机倒计时弹窗
 //! - [`app`]      主界面与事件主控
+//! - [`logger`]   文件日志（~/.auto-shutdown/logs，按天分割，保留 30 天）
 //!
 //! release 构建下标记为纯 GUI 程序，启动时不再弹出控制台黑框；
 //! debug 构建保留控制台以便查看日志输出。
@@ -29,6 +30,7 @@ mod autostart;
 mod countdown;
 mod crypto;
 mod events;
+mod logger;
 mod monitor;
 mod protocol;
 mod tray;
@@ -49,6 +51,14 @@ fn main() {
     if !win32::ensure_single_instance(MAIN_WINDOW_TITLE) {
         return;
     }
+
+    // 文件日志：~/.auto-shutdown/logs/，按天分割，自动清理 30 天前的日志
+    logger::init();
+    crate::log_info!("程序启动 v{}", env!("CARGO_PKG_VERSION"));
+    // panic 也留痕（release 下 panic = abort，hook 仍会先执行再退出）
+    std::panic::set_hook(Box::new(|info| {
+        crate::log_error!("panic: {info}");
+    }));
 
     // 事件通道：所有后台来源（托盘 / 心跳线程 / 倒计时弹窗）统一发到这里，
     // 由 UI 主循环串行处理，避免多线程同时操作 UI 状态。
@@ -97,6 +107,7 @@ fn main() {
             while let Some(event) = event_rx.next().await {
                 // 退出：直接结束整个应用
                 if matches!(event, AppEvent::Quit) {
+                    crate::log_info!("收到退出事件，程序退出");
                     cx.update(|cx| cx.quit());
                     break;
                 }

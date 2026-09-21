@@ -25,7 +25,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::countdown;
 use crate::events::{AppEvent, CountdownChoice, EventTx, HeartStatus, MonitorCommand};
-use crate::protocol::{SNOOZE_LATER_SECONDS, WS_PORT};
+use crate::protocol::{COUNTDOWN_SECONDS, DISCOVERY_PORT, SNOOZE_LATER_SECONDS, WS_PORT};
 use crate::win32;
 
 /// 主窗口标题（同时用于 Win32 按标题查找窗口，必须全局唯一）
@@ -104,6 +104,7 @@ impl AppModel {
             "正在扫描局域网（UDP 广播，发现端口 8124），请稍候…".to_string(),
             false,
         ));
+        crate::log_info!("已发起局域网扫描（UDP 广播，发现端口 {DISCOVERY_PORT}）");
         let _ = cmds.unbounded_send(MonitorCommand::Scan);
 
         Self {
@@ -136,13 +137,21 @@ impl AppModel {
             AppEvent::HeartbeatLost { detail } => self.on_heartbeat_lost(detail, cx),
             AppEvent::ScanFinished(result) => self.on_scan_finished(result, window, cx),
             AppEvent::TestFinished(result) => {
+                match &result {
+                    Ok(msg) => crate::log_info!("手动测试成功: {msg}"),
+                    Err(msg) => crate::log_warn!("手动测试失败: {msg}"),
+                }
                 self.test_result = Some(result);
                 cx.notify();
             }
-            AppEvent::TrayShow => win32::show_window(MAIN_WINDOW_TITLE),
+            AppEvent::TrayShow => {
+                crate::log_info!("托盘：显示主窗口");
+                win32::show_window(MAIN_WINDOW_TITLE);
+            }
             AppEvent::Quit => cx.quit(),
             AppEvent::AutostartChanged(enabled) => {
                 // 托盘菜单切换了开机启动，同步主界面开关
+                crate::log_info!("开机启动已切换为: {enabled}");
                 self.autostart = enabled;
                 cx.notify();
             }
@@ -160,12 +169,16 @@ impl AppModel {
     /// 心跳恢复：更新状态、关闭倒计时弹窗、清除冷却期
     fn on_heartbeat_ok(&mut self, cx: &mut Context<Self>) {
         if self.status != HeartStatus::Connected {
+            crate::log_info!("心跳恢复，状态置为“服务在线”");
             self.status = HeartStatus::Connected;
             self.lost_detail = None;
             // 状态徽章已经表达“服务在线”，提示行清空避免重复
             self.hint = None;
         }
         // 若倒计时还开着（服务在倒计时期间恢复了），直接关掉它
+        if self.countdown.is_some() {
+            crate::log_info!("服务在倒计时期间恢复，自动关闭倒计时弹窗");
+        }
         self.close_countdown(cx);
         self.snooze_until = None;
         self.snooze_gen += 1;
@@ -174,6 +187,7 @@ impl AppModel {
 
     /// 心跳丢失超过阈值：置状态，按冷却期决定是否立即弹窗
     fn on_heartbeat_lost(&mut self, detail: String, cx: &mut Context<Self>) {
+        crate::log_error!("收到心跳失联事件: {detail}");
         self.status = HeartStatus::Lost;
         self.lost_detail = Some(detail);
         self.try_open_countdown(cx);
@@ -191,6 +205,7 @@ impl AppModel {
         self.scanning = false;
         match result {
             Ok(devices) if devices.is_empty() => {
+                crate::log_info!("扫描完成：未发现心跳服务");
                 self.hint = Some((
                     "未在局域网内发现心跳服务。请确认服务端已开机，或手动输入服务地址。".into(),
                     false,
@@ -198,6 +213,12 @@ impl AppModel {
             }
             Ok(devices) => {
                 let first = devices[0].clone();
+                crate::log_info!(
+                    "扫描完成：发现 {} 台设备，取第一台 {}（{}）",
+                    devices.len(),
+                    first.name,
+                    first.addr
+                );
                 // 把找到的地址填入输入框
                 self.input.update(cx, |state, cx| {
                     state.set_value(first.addr.clone(), window, cx)
@@ -215,6 +236,7 @@ impl AppModel {
                 ));
             }
             Err(err) => {
+                crate::log_warn!("扫描失败: {err}");
                 self.hint = Some((format!("扫描失败: {err}"), true));
             }
         }
@@ -223,6 +245,7 @@ impl AppModel {
 
     /// 切换监控目标（仅内存生效，不落盘；本软件不持久化任何数据）
     fn apply_server(&mut self, addr: String) {
+        crate::log_info!("监控目标设置为 {addr}（等待首次连通）");
         self.saved_server = Some(addr.clone());
         self.status = HeartStatus::Waiting;
         self.lost_detail = None;
@@ -233,6 +256,7 @@ impl AppModel {
     fn on_countdown_choice(&mut self, choice: CountdownChoice, cx: &mut Context<Self>) {
         match choice {
             CountdownChoice::Cancel => {
+                crate::log_info!("用户在倒计时弹窗上选择：取消关机（心跳恢复前不再提醒）");
                 // 取消关机：本次彻底不提醒了。心跳监控线程在“恢复 -> 再次丢失”
                 // 之前不会重复上报丢失事件，因此这里只需关窗，无需定时重弹；
                 // 下次心跳恢复（HeartbeatOk）后自动复位，重新进入 60 秒丢失监测。
@@ -243,6 +267,7 @@ impl AppModel {
                 ));
             }
             CountdownChoice::Later => {
+                crate::log_info!("用户在倒计时弹窗上选择：稍后关机（{SNOOZE_LATER_SECONDS} 秒后重弹）");
                 // 稍后关机：关闭弹窗并安排 30 秒后重新弹出完整倒计时
                 self.close_countdown(cx);
                 self.hint = Some((
@@ -281,6 +306,7 @@ impl AppModel {
         self.snooze_until = None;
         let handle = countdown::open_countdown_window(self.events.clone(), cx);
         self.countdown = Some(handle);
+        crate::log_warn!("已弹出关机倒计时窗口（{COUNTDOWN_SECONDS} 秒）");
         // 弹窗时同步主界面的提示
         self.hint = Some(("检测到心跳服务失联，已弹出关机倒计时！".into(), true));
     }
@@ -297,12 +323,12 @@ impl AppModel {
         self.close_countdown(cx);
         self.hint = Some(("正在执行关机…".into(), false));
         cx.notify();
-        eprintln!("[shutdown] 触发系统关机");
+        crate::log_error!("触发系统关机（shutdown /s /t 0）");
         let result = std::process::Command::new("shutdown")
             .args(["/s", "/t", "0", "/c", "自动关机守护：心跳失联自动关机"])
             .spawn();
         if let Err(e) = result {
-            eprintln!("[shutdown] 执行失败: {e}");
+            crate::log_error!("关机命令执行失败: {e}");
             self.hint = Some((format!("关机命令执行失败: {e}"), true));
             cx.notify();
         }
@@ -354,11 +380,13 @@ impl AppModel {
     fn toggle_autostart(&mut self, checked: bool, cx: &mut Context<Self>) {
         match crate::autostart::set_enabled(checked) {
             Ok(()) => {
+                crate::log_info!("开机启动已设置为: {checked}");
                 self.autostart = checked;
                 // 托盘菜单的 √ 同步
                 crate::tray::sync_autostart_checked(checked);
             }
             Err(err) => {
+                crate::log_warn!("设置开机启动失败: {err}");
                 self.hint = Some((format!("设置开机启动失败: {err}"), true));
             }
         }

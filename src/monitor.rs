@@ -82,6 +82,8 @@ async fn run(cmds: &mut UnboundedReceiver<MonitorCommand>, events: &UnboundedSen
     let mut armed = false;
     // 本次丢失周期内是否已经上报过 HeartbeatLost（避免重复弹窗）
     let mut reported_lost = false;
+    // 连续失败次数（仅用于日志展示，方便和 ESP 端日志对照）
+    let mut consec_fail: u32 = 0;
 
     let mut tick = Box::pin(tokio::time::sleep(HEARTBEAT_INTERVAL));
 
@@ -90,11 +92,13 @@ async fn run(cmds: &mut UnboundedReceiver<MonitorCommand>, events: &UnboundedSen
             // 下行命令（UI -> 监控线程）；Err 表示通道已关闭（UI 已退出）
             cmd = cmds.recv() => match cmd {
                 Ok(MonitorCommand::SetTarget(t)) => {
+                    crate::log_info!("设置监控目标: {}", t.as_deref().unwrap_or("(停止监控)"));
                     target = t;
                     // 换了目标，一切从零开始（重新等待首次连通）
                     last_ok = None;
                     armed = false;
                     reported_lost = false;
+                    consec_fail = 0;
                 }
                 Ok(MonitorCommand::Scan) => {
                     let result = scan().await;
@@ -112,25 +116,43 @@ async fn run(cmds: &mut UnboundedReceiver<MonitorCommand>, events: &UnboundedSen
                     match heartbeat_once(&addr).await {
                         Ok(rtt) => {
                             last_ok = Some(Instant::now());
+                            // 每次心跳都留痕，形成完整时间线，可与 ESP 端日志逐条对照
+                            crate::log_info!(
+                                "心跳正常 rtt={}ms target={addr}{}",
+                                rtt.as_millis(),
+                                if consec_fail > 0 {
+                                    format!("（此前连续失败 {consec_fail} 次，已恢复）")
+                                } else {
+                                    String::new()
+                                }
+                            );
+                            consec_fail = 0;
                             if !armed {
                                 // 首次连通：进入戒备状态
                                 armed = true;
                                 reported_lost = false;
+                                crate::log_info!("首次连通，进入戒备状态（此后失联才会触发关机）");
                                 let _ = events.unbounded_send(AppEvent::HeartbeatOk);
                             } else if reported_lost {
                                 // 心跳恢复（服务回来了）
                                 reported_lost = false;
+                                crate::log_info!("服务恢复，上报 HeartbeatOk");
                                 let _ = events.unbounded_send(AppEvent::HeartbeatOk);
                             }
-                            tracing_rtt(rtt);
                         }
                         Err(err) => {
+                            consec_fail += 1;
+                            crate::log_warn!("心跳失败（连续第 {consec_fail} 次）target={addr}: {err}");
                             // 只有“确认过在线”且“距上次成功心跳超过阈值”才触发
                             if armed
                                 && !reported_lost
                                 && last_ok.is_some_and(|t| t.elapsed() >= HEARTBEAT_TIMEOUT)
                             {
                                 reported_lost = true;
+                                crate::log_error!(
+                                    "判定服务失联（距上次成功心跳已超过 {} 秒，最后一次错误: {err}）",
+                                    HEARTBEAT_TIMEOUT.as_secs()
+                                );
                                 let _ = events.unbounded_send(AppEvent::HeartbeatLost { detail: err });
                             }
                         }
@@ -140,11 +162,6 @@ async fn run(cmds: &mut UnboundedReceiver<MonitorCommand>, events: &UnboundedSen
             }
         }
     }
-}
-
-/// 打印往返耗时（无正式日志框架，直接走 stderr 即可满足排查需求）
-fn tracing_rtt(rtt: Duration) {
-    eprintln!("[heartbeat] ok, rtt = {}ms", rtt.as_millis());
 }
 
 /// 当前 Unix 时间戳（毫秒）
@@ -203,6 +220,16 @@ async fn heartbeat_once(addr: &str) -> Result<Duration, String> {
         };
 
         let pong = crypto::open_frame(&text).map_err(|e| format!("心跳应答解密失败: {e}"))?;
+        // 设备随心跳连接推送回来的运行日志：落到 esp-日期.log，继续等 pong
+        if pong["type"] == "log" {
+            crate::logger::write_esp(&format!(
+                "uptime={}s [{}] {}",
+                pong["up"],
+                pong["lv"].as_str().unwrap_or("info"),
+                pong["msg"].as_str().unwrap_or("")
+            ));
+            continue;
+        }
         if pong["type"] == "pong" && pong["nonce"] == nonce {
             // 礼貌地发送 WebSocket Close 帧再断开，
             // 避免服务端把每次心跳都当作“异常断开”记录

@@ -8,6 +8,9 @@
  *   2. UDP 服务端（8124）：收到加密 discover -> 向来源单播加密 announce；
  *   3. Web 管理界面（80）：htmx 单页界面，管理员登录后可配置 WiFi、
  *      修改管理员密码、查看运行状态。配置保存在 EEPROM，掉电不丢。
+ *   4. 日志上报：启动 / WiFi 掉线重连 / 配置变更 / 非法报文 / 周期统计等
+ *      事件记入内存环形缓冲，随下一次心跳连接以加密 "log" 报文推送给 PC，
+ *      由 PC 端写入 ~/.auto-shutdown/logs/esp-日期.log（与 PC 自身日志分开）。
  *
  * 首次使用：没有 WiFi 配置时设备自动开启配置热点 `auto-shutdown-xxxxxx`
  * （无密码），电脑/手机连上后浏览器访问 http://192.168.4.1 ，用默认管理员
@@ -42,6 +45,7 @@
 #include <bearssl/bearssl_hmac.h>  // br_hmac_*
 #include <bearssl/bearssl_block.h> // br_aes_big_*
 #include <ctype.h>
+#include <stdarg.h>                // 日志格式化（vsnprintf）
 #include "htmx_min.h"              // 自动生成：单文件 HTML 片段（web/ 目录 Vite 构建）
 
 // ---------------------------------------------------------------------------
@@ -98,6 +102,53 @@ static char    g_nonce[72];            // 从 ping 中提取的 nonce
 
 static inline unsigned long uptime_s() { return millis() / 1000; }
 
+// ---------------------------------------------------------------------------
+// 日志上报：环形缓冲最近 LOG_CAP 条日志，随下一次心跳连接推送给 PC 落盘
+// （ESP 自身不写文件，只留串口输出；PC 端收到后写入 ~/.auto-shutdown/logs/
+//   下的 esp-日期.log，文件名“日期+类型”，与 PC 自身日志分开存放）
+// ---------------------------------------------------------------------------
+
+#define LOG_CAP 24                     // 缓冲条数（写满丢最旧）
+struct LogEntry {
+  uint32_t up;                         // 发生时刻（开机秒数）
+  char     lv[6];                      // 级别: info / warn / error
+  char     msg[96];                    // 内容（已做 JSON 转义）
+};
+static LogEntry  g_logbuf[LOG_CAP];
+static uint8_t   g_log_head      = 0; // 最旧条目下标
+static uint8_t   g_log_cnt       = 0; // 当前条数
+static uint32_t  g_last_stat_ms  = 0; // 上次周期统计日志时刻
+static uint32_t  g_last_badlog_ms = 0; // 上次非法报文日志时刻（限流，10 秒一条）
+
+// 记录一条日志（lv: "info"/"warn"/"error"），同时输出到串口。
+// 内容会做 JSON 转义，PC 端按 {"type":"log","up":..,"lv":..,"msg":..} 解析。
+static void log_evt(const char *lv, const char *fmt, ...) {
+  static char tmp[112];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(tmp, sizeof(tmp), fmt, ap);
+  va_end(ap);
+
+  LogEntry *e;
+  if (g_log_cnt < LOG_CAP) {
+    e = &g_logbuf[(g_log_head + g_log_cnt) % LOG_CAP];
+    g_log_cnt++;
+  } else {
+    e = &g_logbuf[g_log_head];         // 缓冲已满：覆盖最旧一条
+    g_log_head = (g_log_head + 1) % LOG_CAP;
+  }
+  e->up = uptime_s();
+  snprintf(e->lv, sizeof(e->lv), "%s", lv);
+  size_t o = 0;
+  for (const char *p = tmp; *p && o < sizeof(e->msg) - 2; p++) {
+    if (*p == '"' || *p == '\\') e->msg[o++] = '\\'; // JSON 转义
+    e->msg[o++] = *p;
+  }
+  e->msg[o] = 0;
+  Serial.printf("[%7lu][%-5s] %s\n", (unsigned long)e->up, lv, e->msg);
+}
+
+
 // 前向声明（.ino 不依赖 Arduino IDE 的自动原型生成，保证直接可编译）
 static size_t b64_encode(const uint8_t *in, size_t n, char *out);
 static bool   b64_decode(const char *in, size_t n, uint8_t *out, size_t cap, size_t *outlen);
@@ -106,6 +157,8 @@ static void   udp_tick();
 static void   sha256_buf(const void *data, size_t len, uint8_t out[32]);
 static bool   authed();
 static void   save_config();
+static void   log_evt(const char *lv, const char *fmt, ...);
+static void   flush_logs_to(WiFiClient &c);
 
 // ---------------------------------------------------------------------------
 // 持久化配置（EEPROM）：WiFi 账号密码 + 管理员账号
@@ -344,6 +397,23 @@ static bool send_ws_frame(WiFiClient &c, uint8_t opcode, const char *data, size_
   return c.write((const uint8_t *)data, len) == len;
 }
 
+// 把积压日志逐条作为加密 WS 文本帧推给 PC（PC 在等到 pong 前会一直读取并落盘）。
+// 发送失败则立即返回，剩余日志留在缓冲里等下一次连接。
+static void flush_logs_to(WiFiClient &c) {
+  static char ljson[PLAIN_MAX + 1];
+  static char lb64[B64_MAX];
+  while (g_log_cnt) {
+    LogEntry *e = &g_logbuf[g_log_head];
+    snprintf(ljson, sizeof(ljson),
+             "{\"type\":\"log\",\"up\":%lu,\"lv\":\"%s\",\"msg\":\"%s\"}",
+             (unsigned long)e->up, e->lv, e->msg);
+    size_t n = seal(ljson, lb64);
+    if (n == 0 || !send_ws_frame(c, 0x1, lb64, n)) return;
+    g_log_head = (g_log_head + 1) % LOG_CAP;
+    g_log_cnt--;
+  }
+}
+
 // 读取一个客户端帧（PC 端发来的帧带掩码，这里解掉）
 static bool read_ws_frame(WiFiClient &c, uint8_t *payload, size_t cap,
                           size_t *plen, uint8_t *opcode) {
@@ -423,12 +493,23 @@ static void serve_ws_client(WiFiClient &c) {
     if (opcode != 0x1 || plen == 0) continue; // 只处理文本帧
 
     g_ws_payload[plen] = 0;
-    if (!open_frame((const char *)g_ws_payload, g_json)) { g_bad_count++; continue; }
+    if (!open_frame((const char *)g_ws_payload, g_json)) {
+      g_bad_count++;
+      // 非法报文限流记录（可能是干扰源，也可能是密钥不一致）
+      if (millis() - g_last_badlog_ms > 10000) {
+        g_last_badlog_ms = millis();
+        log_evt("warn", "ws bad frame dropped (total=%lu)", (unsigned long)g_bad_count);
+      }
+      continue;
+    }
     if (!json_eq_type(g_json, "ping")) continue;
     if (!json_get_nonce(g_json, g_nonce, sizeof(g_nonce))) continue;
     snprintf(g_pong, sizeof(g_pong),
              "{\"type\":\"pong\",\"nonce\":\"%s\",\"uptime_s\":%lu}",
              g_nonce, uptime_s());
+    // 先推积压日志、再回 pong：PC 收到匹配的 pong 就会断开，
+    // pong 之后的报文会来不及送达
+    flush_logs_to(c);
     seal(g_pong, g_b64);
     if (send_ws_frame(c, 0x1, g_b64, strlen(g_b64))) {
       g_hb_count++;
@@ -553,6 +634,7 @@ static void handle_login() {
             ct_eq(h, g_cfg.admin_pass_hash, 32);
   if (!ok) {
     delay(300); // 简单的暴力破解抑制
+    log_evt("warn", "login failed, user=%s", user.c_str());
     g_web.sendHeader("Location", "/?err=1");
     g_web.send(303, "text/plain", "");
     return;
@@ -609,6 +691,7 @@ static void handle_wifi() {
   ssid.toCharArray(g_cfg.ssid, sizeof(g_cfg.ssid));
   pass.toCharArray(g_cfg.pass, sizeof(g_cfg.pass));
   save_config();
+  log_evt("info", "wifi config saved, ssid=%s", g_cfg.ssid);
 
   // 立即尝试连接（保持当前 STA/AP 模式组合）
   WiFi.mode(g_ap_active ? WIFI_AP_STA : WIFI_STA);
@@ -633,6 +716,7 @@ static void handle_password() {
   if (newp.length() < 8) { send_err_fragment("新密码至少 8 位"); return; }
   sha256_buf(newp.c_str(), newp.length(), g_cfg.admin_pass_hash);
   save_config();
+  log_evt("info", "admin password changed");
   g_session[0] = 0; // 修改成功后自动登出
   g_web.sendHeader("HX-Redirect", "/"); // htmx 收到后整页跳转回登录页
   send_ok_fragment("密码已修改，正在返回登录页…");
@@ -732,6 +816,7 @@ static void start_ap() {
   WiFi.softAP(ap_ssid); // 开放网络：配置操作由管理员登录保护
   g_dns.start(53, "*", WiFi.softAPIP()); // 劫持所有域名解析 -> Captive Portal
   g_ap_active = true;
+  log_evt("warn", "config AP started: %s", ap_ssid);
   Serial.printf("[ap] %s -> http://%s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
 }
 
@@ -743,6 +828,8 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
   Serial.println("auto-shutdown heartbeat server (ESP8266)");
+  // 复位原因随首条日志上报：PC 端可据此判断设备是否发生过意外重启
+  log_evt("info", "boot, reset reason: %s", ESP.getResetReason().c_str());
 
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH); // 板载 LED 低有效，先熄灭
@@ -787,7 +874,10 @@ void loop() {
   static bool was_conn = false;
   if (conn && !was_conn) {
     g_sta_ok_ms = millis();
-    Serial.printf("[sta] connected, IP: %s\n", WiFi.localIP().toString().c_str());
+    log_evt("info", "wifi connected, ip=%s", WiFi.localIP().toString().c_str());
+  }
+  if (!conn && was_conn) {
+    log_evt("warn", "wifi disconnected");
   }
   was_conn = conn;
 
@@ -799,6 +889,7 @@ void loop() {
         WiFi.softAPdisconnect(true);
         WiFi.mode(WIFI_STA);
         g_ap_active = false;
+        log_evt("info", "config AP closed");
         Serial.println("[ap] closed");
       }
       WiFiClient c = g_ws_server.available();
@@ -809,6 +900,13 @@ void loop() {
   }
 
   udp_tick();
+
+  // 周期性运行统计（5 分钟一条）：让 PC 端日志里有设备的存活轨迹
+  if (conn && millis() - g_last_stat_ms > 300000) {
+    g_last_stat_ms = millis();
+    log_evt("info", "stats: hb=%lu bad=%lu heap=%u", (unsigned long)g_hb_count,
+            (unsigned long)g_bad_count, (unsigned)ESP.getFreeHeap());
+  }
 
   // 板载 LED：未联网闪烁；联网后每次心跳亮一下
   static uint32_t last_led_ms = 0;
