@@ -52,6 +52,8 @@ pub enum AppEvent {
     TrayShow,
     /// 托盘菜单：退出程序
     Quit,
+    /// 开机启动已切换（托盘菜单切换后通知主界面同步开关状态）
+    AutostartChanged(bool),
     /// 主窗口已隐藏到托盘（最小化或关闭按钮触发），UI 可借此清理临时状态
     WindowHidden,
     /// 倒计时结束 / 用户点击“立即关机”

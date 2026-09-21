@@ -18,6 +18,7 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::separator::Separator;
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, IconName, Root, Sizable as _, TitleBar};
 use gpui_kit::{AppContext as _, Context, Entity, InteractiveElement as _, StatefulInteractiveElement as _, FontWeight, ParentElement as _, Render, Styled as _, Window, div, px};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -61,6 +62,8 @@ pub struct AppModel {
     config_open: bool,
     /// 最近一次“测试”的结果
     test_result: Option<Result<String, String>>,
+    /// 开机启动（任务计划程序中的计划任务是否存在）
+    autostart: bool,
     /// 界面提示信息（Some(文本, 是否为错误)）
     hint: Option<(String, bool)>,
     /// 当前打开的倒计时弹窗（None 表示未打开）
@@ -113,6 +116,7 @@ impl AppModel {
             scanning,
             config_open: false,
             test_result: None,
+            autostart: crate::autostart::is_enabled(),
             hint,
             countdown: None,
             snooze_until: None,
@@ -137,6 +141,11 @@ impl AppModel {
             }
             AppEvent::TrayShow => win32::show_window(MAIN_WINDOW_TITLE),
             AppEvent::Quit => cx.quit(),
+            AppEvent::AutostartChanged(enabled) => {
+                // 托盘菜单切换了开机启动，同步主界面开关
+                self.autostart = enabled;
+                cx.notify();
+            }
             // 窗口已收进托盘：清掉临时的测试结果，下次打开时界面是干净的
             AppEvent::WindowHidden => {
                 if self.test_result.take().is_some() {
@@ -340,6 +349,21 @@ impl AppModel {
         ));
         cx.notify();
     }
+
+    /// 切换开机启动（任务计划程序）。失败时保持开关原状并给出提示。
+    fn toggle_autostart(&mut self, checked: bool, cx: &mut Context<Self>) {
+        match crate::autostart::set_enabled(checked) {
+            Ok(()) => {
+                self.autostart = checked;
+                // 托盘菜单的 √ 同步
+                crate::tray::sync_autostart_checked(checked);
+            }
+            Err(err) => {
+                self.hint = Some((format!("设置开机启动失败: {err}"), true));
+            }
+        }
+        cx.notify();
+    }
 }
 
 impl Render for AppModel {
@@ -431,6 +455,43 @@ impl Render for AppModel {
                             ),
                     )
                     .when_some(lost_el, |el, a| el.child(a))
+                    // ---- 开机启动开关（与托盘菜单的“开机启动”为同一功能）----
+                    .child(
+                        div()
+                            .border_1()
+                            .border_color(theme.border)
+                            .rounded(px(10.))
+                            .px_4()
+                            .py_3()
+                            .child(
+                                h_flex()
+                                    .justify_between()
+                                    .items_center()
+                                    .child(
+                                        v_flex()
+                                            .gap_0p5()
+                                            .child(
+                                                Label::new("开机启动")
+                                                    .text_size(px(14.))
+                                                    .font_weight(FontWeight::MEDIUM),
+                                            )
+                                            .child(
+                                                Label::new(
+                                                    "登录 Windows 后自动在后台运行（写入任务计划程序，无需管理员权限）",
+                                                )
+                                                .text_color(theme.muted_foreground)
+                                                .text_size(px(12.)),
+                                            ),
+                                    )
+                                    .child(
+                                        Switch::new("autostart-switch")
+                                            .checked(self.autostart)
+                                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                                this.toggle_autostart(*checked, cx);
+                                            })),
+                                    ),
+                            ),
+                    )
                     // ---- 服务配置（Collapsible，默认收起，点击触发行展开/收起）----
                     .child(
                         Collapsible::new()

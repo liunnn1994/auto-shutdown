@@ -5,17 +5,50 @@
 //!
 //! 交互约定：
 //! - 左键双击托盘图标 → 显示主窗口；
-//! - 右键托盘 → 菜单（显示主窗口 / 退出程序）。
+//! - 右键托盘 → 菜单（显示主窗口 / 开机启动开关 / 退出程序）。
 
-use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+use std::sync::OnceLock;
+
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIconBuilder, TrayIconEvent};
 
 use crate::events::AppEvent;
 
 /// 托盘菜单项 id：显示主窗口
 const MENU_SHOW: &str = "show";
+/// 托盘菜单项 id：开机启动开关
+const MENU_AUTOSTART: &str = "autostart";
 /// 托盘菜单项 id：退出程序
 const MENU_QUIT: &str = "quit";
+
+/// muda 的菜单项内部基于 `Rc`，不实现 `Send`，而 `set_event_handler`
+/// 要求闭包 `Send + Sync`。菜单（及复选项）在主线程创建，Windows 上
+/// 菜单事件回调也始终在创建线程（主线程）派发，因此经此包装在闭包中
+/// 持有菜单项实际从不跨线程使用，是安全的。
+#[derive(Clone)]
+struct SendItem(CheckMenuItem);
+unsafe impl Send for SendItem {}
+unsafe impl Sync for SendItem {}
+
+impl SendItem {
+    fn is_checked(&self) -> bool {
+        self.0.is_checked()
+    }
+    fn set_checked(&self, checked: bool) {
+        self.0.set_checked(checked)
+    }
+}
+
+/// 复选项句柄：主界面开关与托盘菜单控制同一功能，
+/// 这里全局存一份，供任意一侧同步 √ 状态。
+static AUTOSTART_ITEM: OnceLock<SendItem> = OnceLock::new();
+
+/// 同步托盘菜单“开机启动”复选项的 √ 状态（主界面切换后调用）
+pub fn sync_autostart_checked(checked: bool) {
+    if let Some(item) = AUTOSTART_ITEM.get() {
+        item.set_checked(checked);
+    }
+}
 
 /// 创建托盘（必须在主线程调用）。
 ///
@@ -24,8 +57,23 @@ pub fn create_tray(events: crate::events::EventTx) {
     // ---- 菜单 ----
     type Acc = tray_icon::menu::accelerator::Accelerator;
     let show_item = MenuItem::with_id(MENU_SHOW, "显示主窗口", true, None::<Acc>);
+    // 复选项：√ 状态直接以计划任务的当前状态为准
+    let autostart_item = CheckMenuItem::with_id(
+        MENU_AUTOSTART,
+        "开机启动",
+        true,
+        crate::autostart::is_enabled(),
+        None::<Acc>,
+    );
     let quit_item = MenuItem::with_id(MENU_QUIT, "退出程序", true, None::<Acc>);
-    let menu = Menu::with_items(&[&show_item, &quit_item]).expect("创建托盘菜单失败");
+    let menu = Menu::with_items(&[
+        &show_item,
+        &PredefinedMenuItem::separator(),
+        &autostart_item,
+        &PredefinedMenuItem::separator(),
+        &quit_item,
+    ])
+    .expect("创建托盘菜单失败");
 
     // ---- 图标与托盘本体 ----
     let tray = TrayIconBuilder::new()
@@ -40,9 +88,25 @@ pub fn create_tray(events: crate::events::EventTx) {
 
     // ---- 右键菜单事件 ----
     let tx = events.clone();
+    let autostart_for_events = SendItem(autostart_item.clone());
+    let _ = AUTOSTART_ITEM.set(autostart_for_events.clone());
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
         let ev = match e.id().as_ref() {
             MENU_SHOW => AppEvent::TrayShow,
+            MENU_AUTOSTART => {
+                // 切换计划任务，成功后同步 √ 状态并通知主界面；失败则保持原状
+                let target = !autostart_for_events.is_checked();
+                match crate::autostart::set_enabled(target) {
+                    Ok(()) => {
+                        autostart_for_events.set_checked(target);
+                        AppEvent::AutostartChanged(target)
+                    }
+                    Err(err) => {
+                        eprintln!("[tray] 切换开机启动失败: {err}");
+                        return;
+                    }
+                }
+            }
             MENU_QUIT => AppEvent::Quit,
             _ => return,
         };

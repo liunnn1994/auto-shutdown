@@ -14,6 +14,7 @@
 //! - [`crypto`]   报文加解密（AES-256-CTR + HMAC-SHA256）
 //! - [`monitor`]  心跳 / 扫描 / 测试（后台线程）
 //! - [`tray`]     系统托盘
+//! - [`autostart`] 开机启动开关（任务计划程序，无需管理员权限）
 //! - [`win32`]    原生窗口辅助（隐藏 / 恢复 / 拦截最小化）
 //! - [`countdown`] 关机倒计时弹窗
 //! - [`app`]      主界面与事件主控
@@ -24,6 +25,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod autostart;
 mod countdown;
 mod crypto;
 mod events;
