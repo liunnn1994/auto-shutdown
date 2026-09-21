@@ -39,6 +39,7 @@ import protocol
 START_TIME = time.time()   # 进程启动时间（计算 uptime_s）
 OUTAGE_AT = None           # 模拟断电的触发时刻（time.monotonic()），None 表示不断电
 OUTAGE_DURATION = 60.0     # 断电持续时间（秒），期间不回复任何报文
+DEVICE_ID = "python-sim"   # 设备身份（ESP 用芯片 ID），PC 端靠它识别“同一台设备”
 
 
 def log(msg: str) -> None:
@@ -81,7 +82,8 @@ async def handle_ws(ws) -> None:
             mtype = msg.get("type")
             if mtype == "ping" and not in_outage():
                 # 心跳：原样带回 nonce
-                pong = {"type": "pong", "nonce": msg.get("nonce"), "uptime_s": uptime()}
+                pong = {"type": "pong", "nonce": msg.get("nonce"), "uptime_s": uptime(),
+                        "id": DEVICE_ID}
                 await ws.send(protocol.seal(pong))
             elif mtype == "ping" and in_outage():
                 log("[模拟断电中] 收到 ping，假装不在……")
@@ -127,6 +129,7 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
         announce = {
             "type": "announce",
             "name": self.name,
+            "id": DEVICE_ID,
             "ws_port": self.ws_port,
             "uptime_s": uptime(),
         }

@@ -135,6 +135,19 @@ impl AppModel {
         match event {
             AppEvent::HeartbeatOk => self.on_heartbeat_ok(cx),
             AppEvent::HeartbeatLost { detail } => self.on_heartbeat_lost(detail, cx),
+            AppEvent::TargetAutoChanged { old, new } => {
+                // 监控线程发现设备换了 IP（DHCP 重新分配）并已自动接管，
+                // 这里同步界面显示，无需用户任何操作
+                crate::log_warn!("设备 IP 已变更，监控目标自动切换: {old} -> {new}");
+                self.saved_server = Some(new.clone());
+                self.input
+                    .update(cx, |state, cx| state.set_value(new.clone(), window, cx));
+                self.hint = Some((
+                    format!("设备 IP 已变更（{old} → {new}），已自动切换监控目标并重新连通。"),
+                    false,
+                ));
+                cx.notify();
+            }
             AppEvent::ScanFinished(result) => self.on_scan_finished(result, window, cx),
             AppEvent::TestFinished(result) => {
                 match &result {

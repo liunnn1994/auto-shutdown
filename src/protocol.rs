@@ -85,6 +85,10 @@ pub struct Pong {
     /// 服务端已运行的秒数（可选，用于界面展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uptime_s: Option<u64>,
+    /// 设备身份（ESP 用芯片 ID 的十六进制）。PC 端用它在一台设备
+    /// 换了 IP 之后仍能认出是同一台，避免误把别的设备当成目标
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 /// 发现请求：PC 广播
@@ -105,6 +109,9 @@ pub struct Announce {
     pub typ: String,
     /// 设备名称（展示用）
     pub name: String,
+    /// 设备身份（与 pong 中的 id 一致）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// WebSocket 服务端口
     pub ws_port: u16,
     /// 服务端已运行的秒数（可选）

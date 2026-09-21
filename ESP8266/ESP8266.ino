@@ -504,9 +504,10 @@ static void serve_ws_client(WiFiClient &c) {
     }
     if (!json_eq_type(g_json, "ping")) continue;
     if (!json_get_nonce(g_json, g_nonce, sizeof(g_nonce))) continue;
+    // id = 芯片 ID：PC 端据此识别“同一台设备”，IP 被路由器重新分配后仍能自动接管
     snprintf(g_pong, sizeof(g_pong),
-             "{\"type\":\"pong\",\"nonce\":\"%s\",\"uptime_s\":%lu}",
-             g_nonce, uptime_s());
+             "{\"type\":\"pong\",\"nonce\":\"%s\",\"uptime_s\":%lu,\"id\":\"%06x\"}",
+             g_nonce, uptime_s(), (unsigned)ESP.getChipId());
     // 先推积压日志、再回 pong：PC 收到匹配的 pong 就会断开，
     // pong 之后的报文会来不及送达
     flush_logs_to(c);
@@ -536,9 +537,10 @@ void udp_tick() {
 
   if (!open_frame(buf, g_json)) return;      // 非本协议设备（解不开），静默忽略
   if (!json_eq_type(g_json, "discover")) return;
+  // id = 芯片 ID，与 pong 中的一致：PC 端失联验证探测靠它认出同一台设备
   snprintf(g_pong, sizeof(g_pong),
-           "{\"type\":\"announce\",\"name\":\"%s\",\"ws_port\":%u,\"uptime_s\":%lu}",
-           DEV_NAME, (unsigned)WS_PORT, uptime_s());
+           "{\"type\":\"announce\",\"name\":\"%s\",\"id\":\"%06x\",\"ws_port\":%u,\"uptime_s\":%lu}",
+           DEV_NAME, (unsigned)ESP.getChipId(), (unsigned)WS_PORT, uptime_s());
   seal(g_pong, g_b64);
 
   g_udp.beginPacket(g_udp.remoteIP(), g_udp.remotePort());

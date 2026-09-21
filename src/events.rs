@@ -26,6 +26,9 @@ pub struct Device {
     pub name: String,
     /// WebSocket 地址（"ip:port" 形式，不含 scheme）
     pub addr: String,
+    /// 设备身份（ESP 用芯片 ID），旧固件可能不上报
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// 倒计时弹窗上的用户选择
@@ -42,8 +45,10 @@ pub enum CountdownChoice {
 pub enum AppEvent {
     /// 心跳恢复（收到一次成功的 pong）
     HeartbeatOk,
-    /// 心跳丢失超过阈值，服务可能已离线
+    /// 心跳丢失超过阈值，且主动探测确认设备无应答，服务可能已物理离线
     HeartbeatLost { detail: String },
+    /// 监控线程发现设备换了 IP（DHCP 重新分配），已自动切换监控目标
+    TargetAutoChanged { old: String, new: String },
     /// 局域网扫描完成
     ScanFinished(Result<Vec<Device>, String>),
     /// 手动“测试”完成

@@ -27,6 +27,16 @@
   输入服务地址，"测试"按钮做一次完整的心跳握手并显示结果（失败时输出完整错误）。
 - **加密心跳**：所有报文经过 AES-256-CTR 加密 + HMAC-SHA256 校验，
   局域网内不持有口令的设备既无法伪造应答也无法干扰。
+- **失联验证（区分断电与网络故障）**：心跳失败不能区分"设备真的断电"和
+  "路由器/AP 抽风导致被动断连"。判定失联前，软件会主动发 UDP 发现广播验证：
+  设备只要有电、连着网就一定会应答（与 WebSocket 是否可达无关）。
+  - 探测有应答、地址未变 → 设备在线，只是网络路径问题，不触发关机；
+  - 探测有应答、地址变了（DHCP 重新分配）→ 自动切换到新 IP 继续监控，
+    界面提示"设备 IP 已变更"，全程无需人工干预；
+  - 探测无应答且心跳中断超过 60 秒 → 判定设备物理离线，弹出关机倒计时；
+  - 失联后仍会持续探测，设备恢复供电/网络后自动恢复并关闭倒计时。
+  设备在心跳与发现应答中携带身份 `id`（ESP 为芯片 ID），IP 变了也能认出
+  同一台设备，不会误把别的设备当成监控目标。
 - **关机倒计时**：心跳丢失超过 60 秒后弹出**置顶**弹窗，60 秒倒计时实时刷新：
   - **立即关机**：马上执行关机；
   - **取消关机**：本次不再提醒，直到心跳恢复后重新开始监测（再次失联超 60 秒才会再弹）；
@@ -133,9 +143,9 @@ Base64( HMAC-SHA256(k_mac, IV || CT)[32B] || IV[16B] || CT )
 | 方向 | 报文 | 说明 |
 |---|---|---|
 | PC → 服务端（WS） | `{"type":"ping","ts":1700000000000,"nonce":"<hex>"}` | 心跳，3 秒一次 |
-| 服务端 → PC（WS） | `{"type":"pong","nonce":"<同 ping>","uptime_s":123}` | 原样带回 nonce |
+| 服务端 → PC（WS） | `{"type":"pong","nonce":"<同 ping>","uptime_s":123,"id":"a1b2c3"}` | 原样带回 nonce（`id` 为设备身份） |
 | PC → 局域网（UDP 8124 广播） | `{"type":"discover","nonce":"<hex>"}` | 发现扫描 |
-| 服务端 → PC（UDP 单播应答） | `{"type":"announce","name":"heartbeat-server","ws_port":8123,"uptime_s":123}` | 发现应答 |
+| 服务端 → PC（UDP 单播应答） | `{"type":"announce","name":"heartbeat-server","id":"a1b2c3","ws_port":8123,"uptime_s":123}` | 发现应答（`id` 为设备身份，ESP 为芯片 ID） |
 
 ### 时间参数
 
@@ -143,6 +153,8 @@ Base64( HMAC-SHA256(k_mac, IV || CT)[32B] || IV[16B] || CT )
 |---|---|---|
 | 心跳间隔 | 3 秒 | `src/protocol.rs::HEARTBEAT_INTERVAL` |
 | 心跳丢失判定 | 60 秒 | `src/protocol.rs::HEARTBEAT_TIMEOUT` |
+| 失联验证探测起始 | 心跳失败 10 秒后 | `src/monitor.rs::VERIFY_AFTER` |
+| 失联验证探测间隔 | 12 秒 | `src/monitor.rs::PROBE_INTERVAL` |
 | 关机倒计时 | 60 秒 | `src/protocol.rs::COUNTDOWN_SECONDS` |
 | 稍后关机重弹 | 30 秒 | `src/protocol.rs::SNOOZE_LATER_SECONDS` |
 

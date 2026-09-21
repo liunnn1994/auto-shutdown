@@ -4,18 +4,34 @@
 //!
 //! 1. **心跳**：按 [`protocol::HEARTBEAT_INTERVAL`] 周期向心跳服务端发送加密 ping，
 //!    等待 pong。如果“最后一次成功心跳”距今超过 [`protocol::HEARTBEAT_TIMEOUT`]，
-//!    即认为服务端已失联，通过事件通道发出 [`AppEvent::HeartbeatLost`]。
-//! 2. **发现**：收到 [`MonitorCommand::Scan`] 后 UDP 广播 discover，
+//!    且主动探测也确认设备无应答，才认为服务端已失联，
+//!    通过事件通道发出 [`AppEvent::HeartbeatLost`]。
+//! 2. **失联验证（区分“物理离线”与“网络被动断连”）**：心跳失败只能说明
+//!    WebSocket 这条路不通，可能是路由器/AP 抽风，也可能是设备换了 IP，
+//!    并不一定代表设备断电。因此在判定失联前会主动用 UDP 发现广播探测：
+//!    只要设备有电且连着网，就一定会应答 announce（这与 WS 是否可达无关）。
+//!    - 探测有应答且地址未变 → 设备在线，是网络路径问题，不触发关机；
+//!    - 探测有应答但地址变了（DHCP 重新分配）→ 自动切换监控目标并通知界面；
+//!    - 探测无应答且距上次成功心跳超过 60 秒 → 判定设备物理离线。
+//!
+//!    失联上报后仍会继续周期探测，设备恢复后自动上报 [`AppEvent::HeartbeatOk`]。
+//! 3. **发现**：收到 [`MonitorCommand::Scan`] 后 UDP 广播 discover，
 //!    收集 3 秒内的 announce 应答。
-//! 3. **测试**：收到 [`MonitorCommand::Test`] 后对指定地址做一次完整的
+//! 4. **测试**：收到 [`MonitorCommand::Test`] 后对指定地址做一次完整的
 //!    连接 + ping/pong，把成功信息或完整错误链返回给界面。
 //!
 //! ## “戒备”机制（重要）
 //!
 //! 只有**首次成功连通**之后才会开始判定丢失（armed 状态）。也就是说：
 //! 如果用户配置了地址但服务端从未在线（例如尚未部署完成），
-//! 软件不会因此触发关机；只有先确认过设备在线、随后心跳丢失超过 60 秒，
-//! 才认定是服务失联。
+//! 软件不会因此触发关机；只有先确认过设备在线、随后心跳丢失超过 60 秒
+//! 且探测无应答，才认定是服务失联。
+//!
+//! ## 设备身份
+//!
+//! 服务端会在 pong / announce 中携带 `id`（ESP 用芯片 ID）。监控线程记录
+//! 首次连通时的设备身份，此后探测发现的设备先按 `id` 认人、再按地址认人，
+//! 即使 IP 被路由器重新分配也不会认错设备或误认别的设备。
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -36,6 +52,13 @@ use crate::protocol::{self, DISCOVERY_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOU
 
 /// 单次心跳中，建立连接 / 等待 pong 的超时时间
 const STEP_TIMEOUT: Duration = Duration::from_secs(4);
+/// 心跳连续失败多久后开始主动探测（期间可能只是网络抖动，先观察）
+const VERIFY_AFTER: Duration = Duration::from_secs(10);
+/// 两次主动探测之间的最小间隔（每轮探测即一次完整的局域网扫描，约 3 秒）
+const PROBE_INTERVAL: Duration = Duration::from_secs(12);
+/// 探测确认过设备在线后，这份“在线凭证”的有效期。
+/// 过期后若心跳仍未恢复、且新一轮探测也无应答，才允许判定失联。
+const ALIVE_GRACE: Duration = Duration::from_secs(PROBE_INTERVAL.as_secs() * 2);
 /// 局域网扫描的总时长
 const SCAN_DURATION: Duration = Duration::from_secs(3);
 /// 局域网扫描时每轮广播的间隔
@@ -84,6 +107,12 @@ async fn run(cmds: &mut UnboundedReceiver<MonitorCommand>, events: &UnboundedSen
     let mut reported_lost = false;
     // 连续失败次数（仅用于日志展示，方便和 ESP 端日志对照）
     let mut consec_fail: u32 = 0;
+    // 设备身份（pong 中的 id）：首次连通时记录，之后 IP 变了也能认出同一台设备
+    let mut device_id: Option<String> = None;
+    // 上一次主动探测（局域网发现验证）的时刻
+    let mut last_probe: Option<Instant> = None;
+    // 最近一次探测确认设备仍在线的时刻（announce 应答 = 设备有电、在运行）
+    let mut last_seen_alive: Option<Instant> = None;
 
     let mut tick = Box::pin(tokio::time::sleep(HEARTBEAT_INTERVAL));
 
@@ -94,11 +123,14 @@ async fn run(cmds: &mut UnboundedReceiver<MonitorCommand>, events: &UnboundedSen
                 Ok(MonitorCommand::SetTarget(t)) => {
                     crate::log_info!("设置监控目标: {}", t.as_deref().unwrap_or("(停止监控)"));
                     target = t;
-                    // 换了目标，一切从零开始（重新等待首次连通）
+                    // 换了目标，一切从零开始（重新等待首次连通，并重新学习设备身份）
                     last_ok = None;
                     armed = false;
                     reported_lost = false;
                     consec_fail = 0;
+                    device_id = None;
+                    last_probe = None;
+                    last_seen_alive = None;
                 }
                 Ok(MonitorCommand::Scan) => {
                     let result = scan().await;
@@ -114,8 +146,16 @@ async fn run(cmds: &mut UnboundedReceiver<MonitorCommand>, events: &UnboundedSen
             _ = &mut tick => {
                 if let Some(addr) = target.clone() {
                     match heartbeat_once(&addr).await {
-                        Ok(rtt) => {
+                        Ok((rtt, id)) => {
                             last_ok = Some(Instant::now());
+                            last_seen_alive = Some(Instant::now());
+                            // 记录设备身份：此后即使设备换了 IP，探测也能认出它
+                            if let Some(id) = id
+                                && device_id.as_ref() != Some(&id)
+                            {
+                                crate::log_info!("设备身份 id={id}（target={addr}）");
+                                device_id = Some(id);
+                            }
                             // 每次心跳都留痕，形成完整时间线，可与 ESP 端日志逐条对照
                             crate::log_info!(
                                 "心跳正常 rtt={}ms target={addr}{}",
@@ -143,23 +183,130 @@ async fn run(cmds: &mut UnboundedReceiver<MonitorCommand>, events: &UnboundedSen
                         Err(err) => {
                             consec_fail += 1;
                             crate::log_warn!("心跳失败（连续第 {consec_fail} 次）target={addr}: {err}");
-                            // 只有“确认过在线”且“距上次成功心跳超过阈值”才触发
-                            if armed
-                                && !reported_lost
-                                && last_ok.is_some_and(|t| t.elapsed() >= HEARTBEAT_TIMEOUT)
-                            {
-                                reported_lost = true;
-                                crate::log_error!(
-                                    "判定服务失联（距上次成功心跳已超过 {} 秒，最后一次错误: {err}）",
-                                    HEARTBEAT_TIMEOUT.as_secs()
-                                );
-                                let _ = events.unbounded_send(AppEvent::HeartbeatLost { detail: err });
+                            if armed {
+                                let since_ok = last_ok.map_or(Duration::MAX, |t| t.elapsed());
+                                // 心跳失败不能区分“设备断电”和“网络路径问题”：
+                                // 周期性发起 UDP 发现广播主动验证（设备只要有电就应答）。
+                                let probe_due = last_probe.is_none_or(|t| t.elapsed() >= PROBE_INTERVAL);
+                                if since_ok >= VERIFY_AFTER && probe_due {
+                                    last_probe = Some(Instant::now());
+                                    probe_adopt(
+                                        &addr,
+                                        &device_id,
+                                        &mut target,
+                                        &mut reported_lost,
+                                        &mut last_seen_alive,
+                                        events,
+                                    )
+                                    .await;
+                                }
+                                // 只有“确认过在线”、“距上次成功心跳超过阈值”、
+                                // 且最近一次探测也没有发现设备（在线凭证已过期），
+                                // 才判定设备物理离线并触发关机流程
+                                let alive_recent =
+                                    last_seen_alive.is_some_and(|t| t.elapsed() < ALIVE_GRACE);
+                                if !reported_lost
+                                    && since_ok >= HEARTBEAT_TIMEOUT
+                                    && !alive_recent
+                                {
+                                    reported_lost = true;
+                                    crate::log_error!(
+                                        "判定设备物理离线（距上次成功心跳已超过 {} 秒，\
+                                         期间主动探测未发现任何设备，最后一次心跳错误: {err}）",
+                                        HEARTBEAT_TIMEOUT.as_secs()
+                                    );
+                                    let _ = events.unbounded_send(AppEvent::HeartbeatLost {
+                                        detail: format!(
+                                            "心跳中断超过 {} 秒，且局域网发现探测无应答，\
+                                             判定设备物理离线（最后一次心跳错误: {err}）",
+                                            HEARTBEAT_TIMEOUT.as_secs()
+                                        ),
+                                    });
+                                }
                             }
                         }
                     }
                 }
                 tick = Box::pin(tokio::time::sleep(HEARTBEAT_INTERVAL));
             }
+        }
+    }
+}
+
+/// 主动探测 + 自动接管：广播 discover，确认设备是否仍在线。
+///
+/// - 在线且地址未变：仅确认存活（若此前已上报失联，则上报恢复）；
+/// - 在线但地址变了（DHCP 重新分配）：自动切换监控目标并通知界面；
+/// - 无应答：什么都不做（等待心跳阈值判定物理离线）。
+///
+/// 设备身份识别：已记录 `device_id` 时只认 id 匹配的设备（避免把别的
+/// auto-shutdown 设备当成目标）；所有设备都不带 id（旧固件）时退化为按地址认。
+async fn probe_adopt(
+    addr: &str,
+    device_id: &Option<String>,
+    target: &mut Option<String>,
+    reported_lost: &mut bool,
+    last_seen_alive: &mut Option<Instant>,
+    events: &UnboundedSender<AppEvent>,
+) {
+    let devices = match scan().await {
+        Ok(d) => d,
+        Err(e) => {
+            crate::log_warn!("失联验证探测失败（按未发现处理）: {e}");
+            return;
+        }
+    };
+
+    let candidate = match device_id {
+        Some(id) => devices.iter().find(|d| d.id.as_deref() == Some(id.as_str())),
+        // 未学习到设备身份（首次连通前就失联，或对端是旧固件）：
+        // 有 id 的设备一律不认，只在“无 id 设备”里按地址匹配（旧固件兼容）
+        None => devices
+            .iter()
+            .filter(|d| d.id.is_none())
+            .find(|d| d.addr == addr),
+    };
+    let Some(dev) = candidate else {
+        if devices.is_empty() {
+            crate::log_info!("失联验证探测：局域网内未发现任何设备");
+        } else {
+            crate::log_info!(
+                "失联验证探测：发现 {} 台设备但均非监控目标（按 id/地址识别），视为未发现",
+                devices.len()
+            );
+        }
+        return;
+    };
+
+    *last_seen_alive = Some(Instant::now());
+    if dev.addr == addr {
+        crate::log_info!(
+            "失联验证探测：设备 {}（{}）仍应答发现广播，判定设备在线，\
+             疑似网络路径问题，暂不触发失联",
+            dev.name,
+            dev.addr
+        );
+        if *reported_lost {
+            // 已弹过关机倒计时：设备确认活着，立即恢复，自动关掉倒计时
+            *reported_lost = false;
+            crate::log_info!("设备经探测确认恢复，上报 HeartbeatOk");
+            let _ = events.unbounded_send(AppEvent::HeartbeatOk);
+        }
+    } else {
+        // 设备活着，但 IP 变了（典型：路由器 DHCP 重新分配）。
+        // 自动切换监控目标；身份 id 不变，继续沿用。
+        crate::log_warn!(
+            "失联验证探测：设备 {} 已改用新地址 {}（原 {addr}，IP 可能被重新分配），自动切换监控目标",
+            dev.name,
+            dev.addr
+        );
+        let old = addr.to_string();
+        let new = dev.addr.clone();
+        *target = Some(new.clone());
+        let _ = events.unbounded_send(AppEvent::TargetAutoChanged { old, new });
+        if *reported_lost {
+            *reported_lost = false;
+            let _ = events.unbounded_send(AppEvent::HeartbeatOk);
         }
     }
 }
@@ -181,8 +328,8 @@ fn random_nonce() -> String {
 }
 
 /// 执行一次完整心跳：建连 -> 发送加密 ping -> 等待匹配的 pong。
-/// 成功返回往返耗时，失败返回错误描述。
-async fn heartbeat_once(addr: &str) -> Result<Duration, String> {
+/// 成功返回 (往返耗时, 设备身份 id)；失败返回错误描述。
+async fn heartbeat_once(addr: &str) -> Result<(Duration, Option<String>), String> {
     let started = Instant::now();
     let url = to_ws_url(addr);
 
@@ -234,7 +381,8 @@ async fn heartbeat_once(addr: &str) -> Result<Duration, String> {
             // 礼貌地发送 WebSocket Close 帧再断开，
             // 避免服务端把每次心跳都当作“异常断开”记录
             let _ = tx.close().await;
-            return Ok(started.elapsed());
+            let id = pong["id"].as_str().map(str::to_string);
+            return Ok((started.elapsed(), id));
         }
         // 其它报文（例如设备主动推送的状态）直接忽略
     }
@@ -243,7 +391,7 @@ async fn heartbeat_once(addr: &str) -> Result<Duration, String> {
 /// 手动测试：与心跳相同流程，但把成功/完整错误链返回给界面
 async fn test(addr: &str) -> Result<String, String> {
     match heartbeat_once(addr).await {
-        Ok(rtt) => Ok(format!(
+        Ok((rtt, _)) => Ok(format!(
             "连接成功！ping/pong 往返耗时 {} ms。",
             rtt.as_millis()
         )),
@@ -375,5 +523,6 @@ fn decode_announce(data: &[u8], peer: &SocketAddr) -> Option<Device> {
     Some(Device {
         name,
         addr: format!("{ip}:{ws_port}"),
+        id: reply["id"].as_str().map(str::to_string),
     })
 }
