@@ -8,7 +8,7 @@
 //!
 //! - **心跳**: PC 作为 WebSocket 客户端，每隔 [`HEARTBEAT_INTERVAL`] 向服务端的
 //!   `ws://<ip>:8123/ws` 发送一条加密的 `ping` 报文；服务端立即回复 `pong`。
-//!   如果连续 [`HEARTBEAT_TIMEOUT`]（默认 60s）内没有任何一次成功的 ping/pong，
+//!   如果连续 [`HEARTBEAT_TIMEOUT`]（默认 180s）内没有任何一次成功的 ping/pong，
 //!   就认为服务端已经离线（典型部署：服务端插在市电上，离线即市电中断），
 //!   触发关机倒计时。
 //! - **发现**: PC 向局域网广播 UDP 地址 `255.255.255.255:8124` 发送加密的
@@ -47,7 +47,7 @@ pub const DISCOVERY_PORT: u16 = 8124;
 /// 心跳发送间隔（每次心跳都会重新建立 WebSocket 连接，LAN 内开销可忽略）
 pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 /// 心跳超时时间：连续这么长时间没有任何成功的心跳，就认为服务已失联
-pub const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+pub const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// 关机倒计时时长（秒）：倒计时结束仍无人响应则自动关机
 pub const COUNTDOWN_SECONDS: u64 = 60;

@@ -11,7 +11,7 @@ auto-shutdown —— 心跳服务端模拟（以插在市电上的 ESP32 为例�
    收到加密 ping 立即回加密 pong（原样带回 nonce，并附上运行秒数）；
 2. UDP 发现服务：监听 0.0.0.0:8124，收到加密 discover 后向来源单播
    加密 announce（name / ws_port / uptime_s）；
-3. 断电模拟：--outage N 秒后"假装断电"（60 秒内不回复任何报文，
+3. 断电模拟：--outage N 秒后"假装断电"（180 秒内不回复任何报文，
    模拟市电中断、设备失联），随后自动恢复，方便测试 PC 端的
    关机倒计时 / 自动恢复流程。
 
@@ -22,7 +22,7 @@ auto-shutdown —— 心跳服务端模拟（以插在市电上的 ESP32 为例�
 ## 用法示例
 
     python ups_server.py                    # 正常运行
-    python ups_server.py --outage 30        # 启动 30 秒后模拟断电 60 秒
+    python ups_server.py --outage 30        # 启动 30 秒后模拟断电 180 秒
     python ups_server.py --ws-port 8123 --udp-port 8124 --name heartbeat-server
 """
 
@@ -38,7 +38,7 @@ import protocol
 
 START_TIME = time.time()   # 进程启动时间（计算 uptime_s）
 OUTAGE_AT = None           # 模拟断电的触发时刻（time.monotonic()），None 表示不断电
-OUTAGE_DURATION = 60.0     # 断电持续时间（秒），期间不回复任何报文
+OUTAGE_DURATION = 180.0    # 断电持续时间（秒），期间不回复任何报文（需超过 PC 端 180s 失联判定）
 DEVICE_ID = "python-sim"   # 设备身份（ESP 用芯片 ID），PC 端靠它识别“同一台设备”
 
 
@@ -161,7 +161,7 @@ async def main() -> None:
     parser.add_argument("--name", default="heartbeat-server", help="设备名称（发现结果里展示）")
     parser.add_argument(
         "--outage", type=int, default=0, metavar="N",
-        help="启动 N 秒后模拟断电 60 秒（期间不回复任何报文），之后自动恢复",
+        help="启动 N 秒后模拟断电 180 秒（期间不回复任何报文），之后自动恢复",
     )
     args = parser.parse_args()
 
