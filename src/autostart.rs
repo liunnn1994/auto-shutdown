@@ -7,11 +7,18 @@
 //!   （`LogonType = InteractiveToken`、`RunLevel = LUA`），普通用户即可创建；
 //! - 相比注册表 `Run` 项，登录触发不依赖自启动目录，也不需要程序以
 //!   管理员身份安装，且可在“任务计划程序”面板中查看/删除；
+//! - **全局唯一任务**：debug / release / 被移动到任意位置的副本，操作的
+//!   都是同一条 [`TASK_NAME`] 任务——不会因多份程序产生多条任务或脏数据；
+//! - **路径跟随最后一次启动**：每次程序启动都调用 [`sync_registration`]，
+//!   把任务的执行路径替换为当前正在运行的 exe。因此无论从哪个副本启动，
+//!   下次开机登录时启动的都是最后一次运行的那一份；
 //! - 任务存在即视为开启，删除即关闭——任务本身就是开关状态的唯一
-//!   事实来源，无需另外持久化。
+//!   事实来源（与路径无关，路径由启动同步负责），无需另外持久化。
 //!
 //! 所有 COM 调用前按需初始化 COM（gpui 主线程可能已初始化过，
 //! 此时直接复用即可），用完后配额释放。
+
+use std::path::{Path, PathBuf};
 
 use windows::core::{BSTR, Interface as _};
 use windows::Win32::Foundation::VARIANT_BOOL;
@@ -65,13 +72,13 @@ fn root_folder(service: &ITaskService) -> Result<ITaskFolder, String> {
     unsafe { service.GetFolder(&BSTR::from("\\")) }.map_err(|e| format!("打开任务计划根目录失败: {e}"))
 }
 
-/// 当前是否已开启开机启动（计划任务是否存在）
+/// 当前是否已开启开机启动（计划任务是否存在，与任务指向的路径无关）
 pub fn is_enabled() -> bool {
     let owns = init_com();
     let result: Result<bool, String> = (|| {
         let service = connect_task_service()?;
         let folder = root_folder(&service)?;
-        Ok(unsafe { folder.GetTask(&BSTR::from(TASK_NAME)) }.is_ok())
+        task_exists(&folder, TASK_NAME)
     })();
     if owns {
         unsafe { CoUninitialize() };
@@ -92,17 +99,74 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
 fn inner_set_enabled(enabled: bool) -> Result<(), String> {
     let service = connect_task_service()?;
     let folder = root_folder(&service)?;
+    if enabled {
+        let exe = std::env::current_exe().map_err(|e| format!("获取程序路径失败: {e}"))?;
+        register_task(&service, &folder, TASK_NAME, &exe)
+    } else {
+        delete_task(&folder, TASK_NAME)
+    }
+}
 
-    if !enabled {
-        // 任务不存在（文件未找到）也视为成功，保证开关幂等
-        if let Err(e) = unsafe { folder.DeleteTask(&BSTR::from(TASK_NAME), 0) } {
-            if (e.code().0 as u32) != 0x8007_0002 {
-                return Err(format!("删除计划任务失败: {e}"));
+/// 启动同步：任务存在但执行路径不是当前程序时，重新注册为当前程序。
+/// 返回是否执行了重新注册。
+///
+/// 每次程序启动都应调用（且在单实例检查之前）：debug / release / 被
+/// 移动到任意位置的副本，哪一份最后启动，下次开机登录就启动哪一份。
+/// 任务不存在（未开启自启动）时不动。
+pub fn sync_registration() -> Result<bool, String> {
+    let current = std::env::current_exe().map_err(|e| format!("获取程序路径失败: {e}"))?;
+    let owns = init_com();
+    let result: Result<bool, String> = (|| {
+        let service = connect_task_service()?;
+        let folder = root_folder(&service)?;
+        if !task_exists(&folder, TASK_NAME)? {
+            return Ok(false); // 未开启自启动，无事可做
+        }
+        match registered_exe_path(&folder)? {
+            Some(p) if p == current => Ok(false),
+            _ => {
+                register_task(&service, &folder, TASK_NAME, &current)?;
+                Ok(true)
             }
         }
-        return Ok(());
+    })();
+    if owns {
+        unsafe { CoUninitialize() };
     }
+    result
+}
 
+/// 任务是否存在
+fn task_exists(folder: &ITaskFolder, name: &str) -> Result<bool, String> {
+    Ok(unsafe { folder.GetTask(&BSTR::from(name)) }.is_ok())
+}
+
+/// 任务注册的 exe 路径（无 Exec 动作时返回 None）
+fn registered_exe_path(folder: &ITaskFolder) -> Result<Option<PathBuf>, String> {
+    let task = unsafe { folder.GetTask(&BSTR::from(TASK_NAME)) }
+        .map_err(|e| format!("读取计划任务失败: {e}"))?;
+    let definition = unsafe { task.Definition() }.map_err(|e| format!("读取任务定义失败: {e}"))?;
+    let actions = unsafe { definition.Actions() }.map_err(|e| format!("读取任务动作失败: {e}"))?;
+    let mut count = 0i32;
+    unsafe { actions.Count(&mut count) }.map_err(|e| format!("读取动作数量失败: {e}"))?;
+    for i in 1..=count {
+        let Ok(action) = (unsafe { actions.get_Item(i) }) else { continue };
+        let Ok(exec) = action.cast::<IExecAction>() else { continue };
+        let mut path = BSTR::default();
+        if unsafe { exec.Path(&mut path) }.is_ok() {
+            return Ok(Some(PathBuf::from(path.to_string())));
+        }
+    }
+    Ok(None)
+}
+
+/// 注册（同名覆盖更新）一个"用户登录时启动 exe"的任务
+fn register_task(
+    service: &ITaskService,
+    folder: &ITaskFolder,
+    name: &str,
+    exe: &Path,
+) -> Result<(), String> {
     let definition: ITaskDefinition =
         unsafe { service.NewTask(0) }.map_err(|e| format!("创建任务定义失败: {e}"))?;
 
@@ -145,8 +209,7 @@ fn inner_set_enabled(enabled: bool) -> Result<(), String> {
         .map_err(|e| format!("设置触发用户失败: {e}"))?;
     unsafe { trigger.SetEnabled(VB_TRUE) }.map_err(|e| format!("启用触发器失败: {e}"))?;
 
-    // ---- 动作：启动本程序 ----
-    let exe = std::env::current_exe().map_err(|e| format!("获取程序路径失败: {e}"))?;
+    // ---- 动作：启动 exe ----
     let actions: IActionCollection = unsafe { definition.Actions() }
         .map_err(|e| format!("读取任务动作失败: {e}"))?;
     let action: IAction = unsafe { actions.Create(TASK_ACTION_EXEC) }
@@ -161,7 +224,7 @@ fn inner_set_enabled(enabled: bool) -> Result<(), String> {
     let empty = VARIANT::default();
     unsafe {
         folder.RegisterTaskDefinition(
-            &BSTR::from(TASK_NAME),
+            &BSTR::from(name),
             &definition,
             TASK_CREATE_OR_UPDATE.0,
             &empty,
@@ -171,6 +234,16 @@ fn inner_set_enabled(enabled: bool) -> Result<(), String> {
         )
     }
     .map_err(|e| format!("注册计划任务失败: {e}"))?;
+    Ok(())
+}
+
+/// 删除任务。不存在（文件未找到 0x80070002）也视为成功，保证幂等
+fn delete_task(folder: &ITaskFolder, name: &str) -> Result<(), String> {
+    if let Err(e) = unsafe { folder.DeleteTask(&BSTR::from(name), 0) } {
+        if (e.code().0 as u32) != 0x8007_0002 {
+            return Err(format!("删除计划任务失败: {e}"));
+        }
+    }
     Ok(())
 }
 
@@ -189,20 +262,37 @@ fn current_user() -> String {
 mod tests {
     use super::*;
 
-    /// 开关幂等且读写一致：记住初始状态，切换后恢复，不影响用户现有配置
+    /// 测试专用任务名。绝不操作真实的 [`TASK_NAME`]：测试进程的
+    /// `current_exe()` 是 cargo 的测试二进制（`deps/xxx-<hash>.exe`），
+    /// 如果用它注册真实任务，登录时启动的会是测试进程而非本程序，
+    /// 且 cargo 清理构建产物后该路径直接失效——开机自启动随之失灵。
+    const TEST_TASK_NAME: &str = "auto-shutdown-test";
+
+    /// 注册 / 存在检查 / 删除的往返与幂等，全程只操作测试任务
     #[test]
-    fn toggle_roundtrip() {
-        let initial = is_enabled();
+    fn register_roundtrip() {
+        let owns = init_com();
+        let result: Result<(), String> = (|| {
+            let service = connect_task_service()?;
+            let folder = root_folder(&service)?;
+            let exe = std::env::current_exe().map_err(|e| format!("获取测试程序路径失败: {e}"))?;
 
-        set_enabled(true).expect("注册计划任务失败");
-        assert!(is_enabled(), "注册后应读到已开启");
+            // 清掉上次运行可能的残留
+            let _ = delete_task(&folder, TEST_TASK_NAME);
+            assert!(!task_exists(&folder, TEST_TASK_NAME)?, "残留任务未清理");
 
-        set_enabled(false).expect("删除计划任务失败");
-        assert!(!is_enabled(), "删除后应读到已关闭");
-        // 再删一次也应成功（幂等）
-        set_enabled(false).expect("重复删除应幂等");
+            register_task(&service, &folder, TEST_TASK_NAME, &exe)?;
+            assert!(task_exists(&folder, TEST_TASK_NAME)?, "注册后任务应存在");
 
-        set_enabled(initial).expect("恢复初始状态失败");
-        assert_eq!(is_enabled(), initial);
+            delete_task(&folder, TEST_TASK_NAME)?;
+            assert!(!task_exists(&folder, TEST_TASK_NAME)?, "删除后任务应不存在");
+            // 再删一次也应成功（幂等）
+            delete_task(&folder, TEST_TASK_NAME)?;
+            Ok(())
+        })();
+        if owns {
+            unsafe { CoUninitialize() };
+        }
+        result.expect("测试任务往返失败");
     }
 }

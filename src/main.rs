@@ -47,11 +47,6 @@ use app::{AppModel, MAIN_WINDOW_TITLE};
 use events::{AppEvent, MonitorCommand};
 
 fn main() {
-    // 单实例保护：已有实例运行时，把它的主窗口恢复置前，然后直接退出
-    if !win32::ensure_single_instance(MAIN_WINDOW_TITLE) {
-        return;
-    }
-
     // 文件日志：~/.auto-shutdown/logs/，按天分割，自动清理 30 天前的日志
     logger::init();
     crate::log_info!("程序启动 v{}", env!("CARGO_PKG_VERSION"));
@@ -59,6 +54,21 @@ fn main() {
     std::panic::set_hook(Box::new(|info| {
         crate::log_error!("panic: {info}");
     }));
+
+    // 开机启动任务路径同步：无论哪个副本（debug / release / 移动后的
+    // exe）最后启动，都把计划任务的执行路径替换为当前程序。必须在单
+    // 实例检查之前同步执行——即使本次启动因已有实例而退出，路径接管
+    // 也要完成，“最后一次启动的 exe 接管开机启动”。
+    match autostart::sync_registration() {
+        Ok(true) => crate::log_info!("已将开机启动任务指向当前程序"),
+        Ok(false) => {}
+        Err(e) => crate::log_warn!("开机启动任务同步失败: {e}"),
+    }
+
+    // 单实例保护：已有实例运行时，把它的主窗口恢复置前，然后直接退出
+    if !win32::ensure_single_instance(MAIN_WINDOW_TITLE) {
+        return;
+    }
 
     // 事件通道：所有后台来源（托盘 / 心跳线程 / 倒计时弹窗）统一发到这里，
     // 由 UI 主循环串行处理，避免多线程同时操作 UI 状态。
