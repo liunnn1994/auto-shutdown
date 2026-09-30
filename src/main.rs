@@ -70,6 +70,14 @@ fn main() {
         return;
     }
 
+    // 静默启动：本次进程是开机自启动的计划任务拉起的（带
+    // `--from-autostart` 参数），主窗口创建后直接隐藏到托盘，不打扰用户。
+    // 手动双击启动时该值为 false，界面照常显示。
+    let silent_start = autostart::launched_by_task();
+    if silent_start {
+        crate::log_info!("检测到开机自启动启动参数，主窗口将静默进入托盘");
+    }
+
     // 事件通道：所有后台来源（托盘 / 心跳线程 / 倒计时弹窗）统一发到这里，
     // 由 UI 主循环串行处理，避免多线程同时操作 UI 状态。
     let (event_tx, mut event_rx) = futures::channel::mpsc::unbounded::<AppEvent>();
@@ -100,15 +108,25 @@ fn main() {
             let slot_for_closure = model_slot.clone();
 
             let main_window = cx
-                .open_window(main_window_options(Some(bounds)), |window, cx| {
-                    let model =
-                        cx.new(|cx| AppModel::new(event_tx.clone(), cmd_tx.clone(), window, cx));
-                    *slot_for_closure.borrow_mut() = Some(model.clone());
-                    // 第一层视图必须是 Root
-                    let view: gpui_kit::AnyView = model.into();
-                    cx.new(|cx| Root::new(view, window, cx))
-                })
+                .open_window(
+                    main_window_options(Some(bounds), silent_start),
+                    |window, cx| {
+                        let model = cx
+                            .new(|cx| AppModel::new(event_tx.clone(), cmd_tx.clone(), window, cx));
+                        *slot_for_closure.borrow_mut() = Some(model.clone());
+                        // 第一层视图必须是 Root
+                        let view: gpui_kit::AnyView = model.into();
+                        cx.new(|cx| Root::new(view, window, cx))
+                    },
+                )
                 .expect("打开主窗口失败");
+
+            // 开机自启动：窗口一建好就收进托盘。这里紧跟在 open_window
+            // 之后、事件循环第一次让出之前执行，gpui 还没来得及画出第一帧，
+            // 用户看不到界面弹出。托盘图标已在上面创建好，可随时唤出。
+            if silent_start {
+                win32::hide_window(MAIN_WINDOW_TITLE);
+            }
 
             let model = model_slot.borrow().clone().expect("主视图实体未初始化");
             drop(model_slot);
@@ -132,8 +150,12 @@ fn main() {
     });
 }
 
-/// 主窗口参数：自绘标题栏（拦截关闭/最小化到托盘的关键前提）+ 固定初始尺寸
-fn main_window_options(window_bounds: Option<WindowBounds>) -> WindowOptions {
+/// 主窗口参数：自绘标题栏（拦截关闭/最小化到托盘的关键前提）+ 固定初始尺寸。
+///
+/// `silent_start` 为 true（开机自启动）时不创建即显示、不抢焦点——即使
+/// 某个平台后端尚未实现这两个开关，接下来的 [`win32::hide_window`] 也会
+/// 把窗口收进托盘，双保险。
+fn main_window_options(window_bounds: Option<WindowBounds>, silent_start: bool) -> WindowOptions {
     WindowOptions {
         window_bounds,
         titlebar: Some(TitlebarOptions {
@@ -144,6 +166,8 @@ fn main_window_options(window_bounds: Option<WindowBounds>) -> WindowOptions {
         // Windows 上由 TitleBar 自绘控制按钮（TitleBar::window_options 的做法）
         app_owns_titlebar_drag: true,
         window_min_size: Some(size(px(520.), px(390.))),
+        show: !silent_start,
+        focus: !silent_start,
         ..Default::default()
     }
 }

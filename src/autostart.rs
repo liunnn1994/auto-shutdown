@@ -9,6 +9,9 @@
 //!   管理员身份安装，且可在“任务计划程序”面板中查看/删除；
 //! - **全局唯一任务**：debug / release / 被移动到任意位置的副本，操作的
 //!   都是同一条 [`TASK_NAME`] 任务——不会因多份程序产生多条任务或脏数据；
+//! - **静默启动**：任务的启动动作带上 [`AUTOSTART_ARG`] 参数，本次启动据此
+//!   判断"是开机自启动拉起来的"，把主窗口直接隐藏到托盘，不打扰用户
+//!   （手动双击启动仍然正常显示界面，托盘菜单可随时唤出）；
 //! - **路径跟随最后一次启动**：每次程序启动都调用 [`sync_registration`]，
 //!   把任务的执行路径替换为当前正在运行的 exe。因此无论从哪个副本启动，
 //!   下次开机登录时启动的都是最后一次运行的那一份；
@@ -43,6 +46,18 @@ const CLSID_SCHEDULE_SERVICE: windows::core::GUID =
 const TASK_NAME: &str = "auto-shutdown";
 /// 任务描述
 const TASK_DESCRIPTION: &str = "自动关机守护：用户登录时自动启动";
+
+/// 计划任务启动动作附加的参数。开机自启动拉起的进程据此知道"我不是用户
+/// 手动点的"，应把主窗口静默隐藏到托盘，而不是弹到用户面前。
+pub const AUTOSTART_ARG: &str = "--from-autostart";
+
+/// 本次进程是否由开机自启动的计划任务拉起。
+///
+/// 只看第一个非可执行文件名的参数：手动启动不带该参数 → 正常显示界面；
+/// 开机自启动带上 → 静默进托盘。
+pub fn launched_by_task() -> bool {
+    std::env::args_os().skip(1).any(|a| a == AUTOSTART_ARG)
+}
 
 /// VARIANT_BOOL 的 true（COM 约定为 -1）
 const VB_TRUE: VARIANT_BOOL = VARIANT_BOOL(-1);
@@ -107,7 +122,7 @@ fn inner_set_enabled(enabled: bool) -> Result<(), String> {
     }
 }
 
-/// 启动同步：任务存在但执行路径不是当前程序时，重新注册为当前程序。
+/// 启动同步：任务的执行路径或启动参数不是当前期望值时，重新注册。
 /// 返回是否执行了重新注册。
 ///
 /// 每次程序启动都应调用（且在单实例检查之前）：debug / release / 被
@@ -122,8 +137,9 @@ pub fn sync_registration() -> Result<bool, String> {
         if !task_exists(&folder, TASK_NAME)? {
             return Ok(false); // 未开启自启动，无事可做
         }
-        match registered_exe_path(&folder)? {
-            Some(p) if p == current => Ok(false),
+        match registered_action(&folder, TASK_NAME)? {
+            // 路径一致且已带静默启动参数：无需重写
+            Some((p, args)) if p == current && args.as_deref() == Some(AUTOSTART_ARG) => Ok(false),
             _ => {
                 register_task(&service, &folder, TASK_NAME, &current)?;
                 Ok(true)
@@ -141,9 +157,12 @@ fn task_exists(folder: &ITaskFolder, name: &str) -> Result<bool, String> {
     Ok(unsafe { folder.GetTask(&BSTR::from(name)) }.is_ok())
 }
 
-/// 任务注册的 exe 路径（无 Exec 动作时返回 None）
-fn registered_exe_path(folder: &ITaskFolder) -> Result<Option<PathBuf>, String> {
-    let task = unsafe { folder.GetTask(&BSTR::from(TASK_NAME)) }
+/// 任务注册的执行动作：(exe 路径, 启动参数)。无可用 Exec 动作时返回 None
+fn registered_action(
+    folder: &ITaskFolder,
+    name: &str,
+) -> Result<Option<(PathBuf, Option<String>)>, String> {
+    let task = unsafe { folder.GetTask(&BSTR::from(name)) }
         .map_err(|e| format!("读取计划任务失败: {e}"))?;
     let definition = unsafe { task.Definition() }.map_err(|e| format!("读取任务定义失败: {e}"))?;
     let actions = unsafe { definition.Actions() }.map_err(|e| format!("读取任务动作失败: {e}"))?;
@@ -153,9 +172,16 @@ fn registered_exe_path(folder: &ITaskFolder) -> Result<Option<PathBuf>, String> 
         let Ok(action) = (unsafe { actions.get_Item(i) }) else { continue };
         let Ok(exec) = action.cast::<IExecAction>() else { continue };
         let mut path = BSTR::default();
-        if unsafe { exec.Path(&mut path) }.is_ok() {
-            return Ok(Some(PathBuf::from(path.to_string())));
+        if unsafe { exec.Path(&mut path) }.is_err() {
+            continue;
         }
+        let mut arguments = BSTR::default();
+        let args = if unsafe { exec.Arguments(&mut arguments) }.is_ok() {
+            Some(arguments.to_string()).filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+        return Ok(Some((PathBuf::from(path.to_string()), args)));
     }
     Ok(None)
 }
@@ -219,6 +245,9 @@ fn register_task(
         .map_err(|e| format!("获取启动动作失败: {e}"))?;
     unsafe { exec.SetPath(&BSTR::from(exe.display().to_string())) }
         .map_err(|e| format!("设置启动路径失败: {e}"))?;
+    // 带上静默启动标记：开机登录时窗口直接进托盘，不弹到用户面前
+    unsafe { exec.SetArguments(&BSTR::from(AUTOSTART_ARG)) }
+        .map_err(|e| format!("设置启动参数失败: {e}"))?;
 
     // ---- 注册（同名任务覆盖更新）----
     let empty = VARIANT::default();
@@ -283,6 +312,15 @@ mod tests {
 
             register_task(&service, &folder, TEST_TASK_NAME, &exe)?;
             assert!(task_exists(&folder, TEST_TASK_NAME)?, "注册后任务应存在");
+            // 启动动作必须带上静默启动标记，否则开机自启动会弹界面
+            let (path, args) =
+                registered_action(&folder, TEST_TASK_NAME)?.expect("注册后应能读到执行动作");
+            assert_eq!(path, exe, "执行路径应为注册时的 exe");
+            assert_eq!(
+                args.as_deref(),
+                Some(AUTOSTART_ARG),
+                "启动参数应包含静默启动标记"
+            );
 
             delete_task(&folder, TEST_TASK_NAME)?;
             assert!(!task_exists(&folder, TEST_TASK_NAME)?, "删除后任务应不存在");
