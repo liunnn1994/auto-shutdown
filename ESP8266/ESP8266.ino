@@ -92,6 +92,17 @@ static char    g_session[17] = "";     // 当前管理员会话令牌（空 = �
 static bool    g_ap_active  = false;
 static uint32_t g_sta_since  = 0;      // 开始尝试连接 STA 的时刻
 static uint32_t g_sta_ok_ms  = 0;      // 最近一次 STA 连上时刻（热点延迟关闭用）
+static const uint32_t WIFI_RETRY_MS = 30000;
+static const uint32_t WIFI_RESET_MS = 120000;
+static uint32_t g_sta_retry_ms = 0;
+static uint32_t g_sta_reset_ms = 0;
+static uint32_t g_sta_retries = 0;
+static uint32_t g_sta_resets = 0;
+static bool g_sta_reset_pending = false;
+static WiFiEventHandler g_wifi_disconnect_handler; // 必须保留，否则回调会被注销
+static uint8_t g_wifi_reason = 0;
+static uint32_t g_wifi_disconnects = 0;
+static bool g_wifi_event_pending = false;
 
 // 单线程事件循环使用的工作缓冲区（避免占用栈空间）
 static uint8_t g_ws_payload[B64_MAX + 2]; // WS 帧载荷（即 Base64 加密帧文本）
@@ -696,10 +707,13 @@ static void handle_wifi() {
   log_evt("info", "wifi config saved, ssid=%s", g_cfg.ssid);
 
   // 立即尝试连接（保持当前 STA/AP 模式组合）
+  g_sta_reset_pending = false;
   WiFi.mode(g_ap_active ? WIFI_AP_STA : WIFI_STA);
   if (pass.length()) WiFi.begin(g_cfg.ssid, g_cfg.pass);
   else               WiFi.begin(g_cfg.ssid);
   g_sta_since = millis();
+  g_sta_retry_ms = g_sta_reset_ms = g_sta_since;
+  g_sta_retries = g_sta_resets = 0;
 
   String s = "<div class=\"alert alert-success py-2 text-sm\">已保存，正在连接 ";
   s += html_escape(g_cfg.ssid);
@@ -837,6 +851,15 @@ void setup() {
   digitalWrite(LED_BUILTIN, HIGH); // 板载 LED 低有效，先熄灭
 
   load_config();
+  // 配置只由本程序的 EEPROM 保存；重试不写 SDK Flash、不删除凭据。
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  g_wifi_disconnect_handler = WiFi.onStationModeDisconnected(
+      [](const WiFiEventStationModeDisconnected &event) {
+        g_wifi_reason = (uint8_t)event.reason;
+        ++g_wifi_disconnects;
+        g_wifi_event_pending = true;
+      });
 
   // 派生密钥：k_enc = SHA256(PASSPHRASE ":enc")，k_mac = SHA256(PASSPHRASE ":mac")
   char tmp[80];
@@ -853,6 +876,7 @@ void setup() {
     if (g_cfg.pass[0]) WiFi.begin(g_cfg.ssid, g_cfg.pass);
     else               WiFi.begin(g_cfg.ssid);
     g_sta_since = millis();
+    g_sta_retry_ms = g_sta_reset_ms = g_sta_since;
     Serial.print("WiFi connecting");
   } else {
     Serial.println("WiFi not configured");
@@ -874,12 +898,32 @@ void loop() {
 
   bool conn = WiFi.status() == WL_CONNECTED;
   static bool was_conn = false;
+  if (g_wifi_event_pending) {
+    g_wifi_event_pending = false;
+    log_evt("warn", "wifi event: reason=%u status=%d mode=%d disconnects=%lu",
+            g_wifi_reason, (int)WiFi.status(), (int)WiFi.getMode(),
+            (unsigned long)g_wifi_disconnects);
+  }
   if (conn && !was_conn) {
     g_sta_ok_ms = millis();
-    log_evt("info", "wifi connected, ip=%s", WiFi.localIP().toString().c_str());
+    log_evt("info", "wifi connected, ip=%s offline=%lus retries=%lu resets=%lu reason=%u",
+            WiFi.localIP().toString().c_str(),
+            (unsigned long)((g_sta_ok_ms - g_sta_since) / 1000),
+            (unsigned long)g_sta_retries, (unsigned long)g_sta_resets, g_wifi_reason);
+    // 网络接口恢复后重新绑定监听服务。
+    g_ws_server.begin();
+    g_ws_server.setNoDelay(true);
+    g_udp.stop();
+    g_udp.begin(UDP_PORT);
+    g_web.begin(WEB_PORT);
   }
   if (!conn && was_conn) {
-    log_evt("warn", "wifi disconnected");
+    g_sta_since = millis(); // 本次掉线重新计时，而不是沿用启动时刻
+    g_sta_retry_ms = g_sta_reset_ms = g_sta_since;
+    g_sta_retries = g_sta_resets = 0;
+    g_ws_server.stop();
+    g_udp.stop();
+    log_evt("warn", "wifi disconnected, reason=%u status=%d", g_wifi_reason, (int)WiFi.status());
   }
   was_conn = conn;
 
@@ -896,8 +940,41 @@ void loop() {
       }
       WiFiClient c = g_ws_server.available();
       if (c) serve_ws_client(c);
-    } else if (!g_ap_active && millis() - g_sta_since > 30000) {
-      start_ap(); // 连不上（如改了路由器密码）：开热点兜底供重新配置
+    } else {
+      uint32_t now = millis();
+      if (g_sta_reset_pending) {
+        if (now - g_sta_reset_ms >= 250) {
+          g_sta_reset_pending = false;
+          WiFi.mode(g_ap_active ? WIFI_AP_STA : WIFI_STA);
+          WiFi.setSleepMode(WIFI_NONE_SLEEP);
+          WiFi.setAutoReconnect(true);
+          WiFi.begin(g_cfg.ssid, g_cfg.pass);
+          g_sta_retry_ms = now;
+          g_web.begin(WEB_PORT);
+          log_evt("info", "wifi STA restarted, status=%d", (int)WiFi.status());
+        }
+      } else if (now - g_sta_reset_ms >= WIFI_RESET_MS) {
+        ++g_sta_resets;
+        log_evt("warn", "wifi STA reset #%lu offline=%lus status=%d reason=%u heap=%u",
+                (unsigned long)g_sta_resets, (unsigned long)((now - g_sta_since) / 1000),
+                (int)WiFi.status(), g_wifi_reason, (unsigned)ESP.getFreeHeap());
+        // 仅停用 STA 接口，保留配置热点和 EEPROM 中的账号密码。
+        WiFi.disconnect(false, false);
+        WiFi.enableSTA(false);
+        g_sta_reset_ms = now;
+        g_sta_reset_pending = true;
+      } else if (now - g_sta_retry_ms >= WIFI_RETRY_MS) {
+        ++g_sta_retries;
+        log_evt("warn", "wifi retry #%lu offline=%lus status=%d reason=%u heap=%u",
+                (unsigned long)g_sta_retries, (unsigned long)((now - g_sta_since) / 1000),
+                (int)WiFi.status(), g_wifi_reason, (unsigned)ESP.getFreeHeap());
+        WiFi.disconnect(false, false); // 终止可能卡住的连接尝试，不删除凭据
+        WiFi.begin(g_cfg.ssid, g_cfg.pass); // 无限重试已保存的网络
+        g_sta_retry_ms = now;
+      }
+      if (!g_sta_reset_pending && !g_ap_active && now - g_sta_since >= 30000) {
+        start_ap(); // 热点仅供手动改配置，不停止 STA 重试
+      }
     }
   }
 
