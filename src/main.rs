@@ -2,16 +2,14 @@
 //!
 //! 工作方式概览：
 //!
-//! 1. 一台常驻的 WebSocket 心跳服务端（任何 socket 服务均可；本项目以
-//!    插在市电上的 ESP32 为例，参考 `python/heartbeat_server.py`，可原样移植）；
+//! 1. 插在市电上的 ESP8266 持续广播，PC 默认通过无线扫描随机挑战认证其在线状态；
 //! 2. 本软件在 PC 上运行：主界面负责配置与状态展示，托盘常驻，
-//!    后台线程每 3 秒发送一次加密心跳；
-//! 3. 若连续 60 秒心跳无响应 → 判定服务失联 → 弹出置顶的 60 秒
+//!    广播监控每轮结束等待 15 秒；
+//! 3. 若连续 180 秒心跳无响应 → 按失联策略弹出置顶的 60 秒
 //!    关机倒计时，倒计时结束无人干预则自动关机。
 //!
 //! 模块划分：
 //! - [`protocol`] 通信协议常量与报文定义
-//! - [`crypto`]   报文加解密（AES-256-CTR + HMAC-SHA256）
 //! - [`monitor`]  心跳 / 扫描 / 测试（后台线程）
 //! - [`tray`]     系统托盘
 //! - [`autostart`] 开机启动开关（任务计划程序，无需管理员权限）
@@ -28,11 +26,12 @@
 mod app;
 mod autostart;
 mod countdown;
-mod crypto;
 mod events;
 mod logger;
 mod monitor;
 mod protocol;
+mod radio;
+mod radio_protocol;
 mod tray;
 mod win32;
 
@@ -47,6 +46,18 @@ use app::{AppModel, MAIN_WINDOW_TITLE};
 use events::{AppEvent, MonitorCommand};
 
 fn main() {
+    // 仅执行无线诊断，不启动界面、自启动注册、失联监控或关机。
+    if std::env::args().any(|arg| arg == "--radio-check") {
+        logger::init();
+        match radio::discover() {
+            Ok(devices) => {
+                crate::log_info!("无线扫描诊断完成，认证设备数={}", devices.len());
+                for device in devices { crate::log_info!("认证广播设备 {}", device.addr); }
+            }
+            Err(error) => { crate::log_error!("无线扫描诊断失败: {error}"); std::process::exit(1); }
+        }
+        return;
+    }
     // 文件日志：~/.auto-shutdown/logs/，按天分割，自动清理 30 天前的日志
     logger::init();
     crate::log_info!("程序启动 v{}", env!("CARGO_PKG_VERSION"));

@@ -2,7 +2,7 @@
 //!
 //! [`AppModel`] 同时承担两个角色：
 //!
-//! 1. **主界面视图**：状态展示、服务地址配置（扫描 / 测试 / 保存）；
+//! 1. **主界面视图**：状态展示、广播设备配置（扫描 / 测试 / 保存）；
 //! 2. **事件主控**：接收托盘、心跳监控线程、倒计时弹窗发来的
 //!    [`AppEvent`]，驱动整个应用的状态机（弹倒计时、关机、托盘显隐等）。
 
@@ -25,23 +25,15 @@ use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::countdown;
 use crate::events::{AppEvent, CountdownChoice, EventTx, HeartStatus, MonitorCommand};
-use crate::protocol::{COUNTDOWN_SECONDS, DISCOVERY_PORT, SNOOZE_LATER_SECONDS, WS_PORT};
+use crate::protocol::{COUNTDOWN_SECONDS, SNOOZE_LATER_SECONDS};
 use crate::win32;
 
 /// 主窗口标题（同时用于 Win32 按标题查找窗口，必须全局唯一）
 pub const MAIN_WINDOW_TITLE: &str = "自动关机守护 - 心跳失联自动关机";
 
 // ---------------------------------------------------------------------------
-// 本软件不持久化任何数据：每次启动都重新扫描局域网。
-// 下面仅保留旧版本遗留配置文件的清理逻辑。
+// 本软件不持久化监控配置：每次启动重新发现认证广播。
 // ---------------------------------------------------------------------------
-
-/// 旧版本配置文件路径（本软件已不再读写，仅用于启动时清理遗留文件）
-fn legacy_config_path() -> Option<std::path::PathBuf> {
-    std::env::var("APPDATA")
-        .ok()
-        .map(|base| std::path::PathBuf::from(base).join("auto-shutdown").join("config.json"))
-}
 
 // ---------------------------------------------------------------------------
 // 主视图 + 主控
@@ -52,11 +44,11 @@ pub struct AppModel {
     status: HeartStatus,
     /// 心跳丢失时的错误详情（展示用）
     lost_detail: Option<String>,
-    /// 服务地址输入框
+    /// 广播设备标识输入框
     input: Entity<InputState>,
-    /// 已保存（并生效中）的服务地址
+    /// 生效中的广播设备标识
     saved_server: Option<String>,
-    /// 是否正在扫描局域网
+    /// 是否正在扫描广播
     scanning: bool,
     /// 「服务配置」折叠面板是否展开（默认收起）
     config_open: bool,
@@ -94,24 +86,20 @@ impl AppModel {
         // 拦截最小化按钮：同样是隐藏到托盘（Win32 子类化实现）
         win32::hook_minimize_to_tray(MAIN_WINDOW_TITLE);
 
-        // 不持久化任何数据：清理旧版本遗留的配置文件，然后每次启动都重新扫描
-        if let Some(path) = legacy_config_path() {
-            let _ = std::fs::remove_file(path);
-        }
         let status = HeartStatus::NotConfigured;
         let scanning = true;
         let hint = Some((
-            "正在扫描局域网（UDP 广播，发现端口 8124），请稍候…".to_string(),
+            "正在扫描开发板无线广播并验证随机挑战，请稍候…".to_string(),
             false,
         ));
-        crate::log_info!("已发起局域网扫描（UDP 广播，发现端口 {DISCOVERY_PORT}）");
+        crate::log_info!("已发起开发板无线广播认证扫描（无需连接开发板网络）");
         let _ = cmds.unbounded_send(MonitorCommand::Scan);
 
         Self {
             status,
             lost_detail: None,
             input: cx.new(|cx| {
-                InputState::new(window, cx).placeholder(format!("例如: 192.168.1.100（默认端口 {WS_PORT}）"))
+                InputState::new(window, cx).placeholder("例如: radio://d86071")
             }),
             saved_server: None,
             scanning,
@@ -134,20 +122,14 @@ impl AppModel {
     pub fn handle_event(&mut self, event: AppEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             AppEvent::HeartbeatOk => self.on_heartbeat_ok(cx),
-            AppEvent::HeartbeatLost { detail } => self.on_heartbeat_lost(detail, cx),
-            AppEvent::TargetAutoChanged { old, new } => {
-                // 监控线程发现设备换了 IP（DHCP 重新分配）并已自动接管，
-                // 这里同步界面显示，无需用户任何操作
-                crate::log_warn!("设备 IP 已变更，监控目标自动切换: {old} -> {new}");
-                self.saved_server = Some(new.clone());
-                self.input
-                    .update(cx, |state, cx| state.set_value(new.clone(), window, cx));
-                self.hint = Some((
-                    format!("设备 IP 已变更（{old} → {new}），已自动切换监控目标并重新连通。"),
-                    false,
-                ));
+            AppEvent::HeartbeatUnconfirmed { detail } => {
+                crate::log_warn!("最新广播认证未确认，界面切换为等待确认: {detail}");
+                self.status = HeartStatus::Unconfirmed;
+                self.lost_detail = Some(detail);
+                self.hint = Some(("未收到最新认证应答，正在确认设备状态；持续失联 180 秒后才会启动关机倒计时。".into(), false));
                 cx.notify();
             }
+            AppEvent::HeartbeatLost { detail } => self.on_heartbeat_lost(detail, cx),
             AppEvent::ScanFinished(result) => self.on_scan_finished(result, window, cx),
             AppEvent::TestFinished(result) => {
                 match &result {
@@ -220,7 +202,7 @@ impl AppModel {
             Ok(devices) if devices.is_empty() => {
                 crate::log_info!("扫描完成：未发现心跳服务");
                 self.hint = Some((
-                    "未在局域网内发现心跳服务。请确认服务端已开机，或手动输入服务地址。".into(),
+                    "未发现通过认证的开发板广播。请确认两端均为 ASR2 版本、无线网卡开启且允许定位访问；将继续扫描。".into(),
                     false,
                 ));
             }
@@ -240,7 +222,7 @@ impl AppModel {
                 self.apply_server(first.addr.clone());
                 self.hint = Some((
                     format!(
-                        "发现 {} 台设备：{}（{}），已自动连接并开始监控。",
+                        "发现 {} 台设备：{}（{}），已选择并开始监控。",
                         devices.len(),
                         first.name,
                         first.addr
@@ -272,10 +254,10 @@ impl AppModel {
                 crate::log_info!("用户在倒计时弹窗上选择：取消关机（心跳恢复前不再提醒）");
                 // 取消关机：本次彻底不提醒了。心跳监控线程在“恢复 -> 再次丢失”
                 // 之前不会重复上报丢失事件，因此这里只需关窗，无需定时重弹；
-                // 下次心跳恢复（HeartbeatOk）后自动复位，重新进入 60 秒丢失监测。
+                // 下次心跳恢复（HeartbeatOk）后自动复位，重新进入 180 秒失联监测。
                 self.close_countdown(cx);
                 self.hint = Some((
-                    "已取消本次关机。心跳恢复后会重新开始监测，若再次失联超过 60 秒将再次提醒。".into(),
+                    "已取消本次关机。心跳恢复后会重新开始监测，若再次失联超过 180 秒将再次提醒。".into(),
                     false,
                 ));
             }
@@ -354,7 +336,7 @@ impl AppModel {
     /// “扫描局域网”按钮
     fn start_scan(&mut self, cx: &mut Context<Self>) {
         self.scanning = true;
-        self.hint = Some(("正在扫描局域网，请稍候…".into(), false));
+        self.hint = Some(("正在扫描并认证开发板无线广播，请稍候…".into(), false));
         let _ = self.cmds.unbounded_send(MonitorCommand::Scan);
         cx.notify();
     }
@@ -363,7 +345,7 @@ impl AppModel {
     fn start_test(&mut self, cx: &mut Context<Self>) {
         let addr = self.input.read(cx).value().trim().to_string();
         if addr.is_empty() {
-            self.test_result = Some(Err("请先输入服务地址".into()));
+            self.test_result = Some(Err("请先输入广播设备标识".into()));
             cx.notify();
             return;
         }
@@ -376,14 +358,19 @@ impl AppModel {
     fn save_and_start(&mut self, cx: &mut Context<Self>) {
         let addr = self.input.read(cx).value().trim().to_string();
         if addr.is_empty() {
-            self.hint = Some(("请先输入服务地址".into(), true));
+            self.hint = Some(("请先输入广播设备标识".into(), true));
+            cx.notify();
+            return;
+        }
+        if let Err(error) = crate::radio_protocol::target_id(&addr) {
+            self.hint = Some((error, true));
             cx.notify();
             return;
         }
         self.apply_server(addr);
         self.test_result = None;
         self.hint = Some((
-            "已开始监控（地址仅本次运行生效，重启后重新扫描或输入）。首次连通前不会触发关机（防误报）。".into(),
+            "已开始广播监控（设备标识仅本次运行生效，重启后重新扫描）。首次认证成功前不会触发关机。".into(),
             false,
         ));
         cx.notify();
@@ -413,9 +400,10 @@ impl Render for AppModel {
 
         // ---- 状态（图标 + tooltip 文案 + 着色）----
         let (status_text, status_color, status_icon) = match self.status {
-            HeartStatus::NotConfigured => ("尚未配置服务地址", theme.muted_foreground, IconName::Info),
-            HeartStatus::Waiting => ("等待首次连通心跳服务", theme.warning, IconName::BatteryCharging),
+            HeartStatus::NotConfigured => ("尚未选择监控设备", theme.muted_foreground, IconName::Info),
+            HeartStatus::Waiting => ("等待首次有效心跳", theme.warning, IconName::BatteryCharging),
             HeartStatus::Connected => ("服务在线，心跳正常", theme.success, IconName::CircleCheck),
+            HeartStatus::Unconfirmed => ("未收到认证应答，正在确认设备状态", theme.warning, IconName::Info),
             HeartStatus::Lost => ("心跳丢失！服务可能已离线", theme.danger, IconName::TriangleAlert),
         };
 
@@ -556,7 +544,7 @@ impl Render for AppModel {
                                             .justify_between()
                                             .items_center()
                                             .child(
-                                                Label::new("服务配置")
+                                                    Label::new("设备配置")
                                                     .text_size(px(14.))
                                                     .font_weight(FontWeight::MEDIUM),
                                             )
@@ -588,7 +576,7 @@ impl Render for AppModel {
                                                     .label(if self.scanning {
                                                         "扫描中…"
                                                     } else {
-                                                        "扫描局域网"
+                                                        "扫描开发板"
                                                     })
                                                     .disabled(self.scanning)
                                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -623,17 +611,17 @@ impl Render for AppModel {
                             v_flex()
                                 .gap_1()
                                 .child(
-                                    Label::new("1. 一台常驻的 WebSocket 心跳服务端（默认端口 8123），任何 socket 服务均可；")
+                                    Label::new("1. 开发板插在普通市电上，电脑由 UPS 供电；开发板广播无需连接路由器；")
                                         .text_color(theme.muted_foreground)
                                         .text_size(px(12.)),
                                 )
                                 .child(
-                                    Label::new("2. 本软件每 3 秒向它发送一次加密心跳，只要能收到应答，就说明服务在线；")
+                                    Label::new("2. 电脑周期扫描无线广播，通过随机挑战认证在线状态，不切换当前 Wi-Fi；")
                                         .text_color(theme.muted_foreground)
                                         .text_size(px(12.)),
                                 )
                                 .child(
-                                    Label::new("3. 如果连续 60 秒收不到任何应答，判定服务离线，弹出置顶的 60 秒关机倒计时；")
+                                    Label::new("3. 如果连续 180 秒没有有效应答，按失联策略弹出 60 秒关机倒计时；")
                                         .text_color(theme.muted_foreground)
                                         .text_size(px(12.)),
                                 )

@@ -1,6 +1,6 @@
 //! # 关机倒计时弹窗
 //!
-//! 心跳服务失联（心跳丢失超过 60 秒）时弹出的**置顶**独立窗口：
+//! 心跳服务失联（连续 180 秒未认证成功）时弹出的**置顶**独立窗口：
 //!
 //! - 一个不断刷新的 60 秒倒计时（`ProgressCircle` 环形进度 + 剩余秒数）；
 //! - 三个标准 `Button`：
@@ -29,7 +29,7 @@ use gpui_kit::{
 };
 
 use crate::events::{AppEvent, CountdownChoice};
-use crate::protocol::COUNTDOWN_SECONDS;
+use crate::protocol::{COUNTDOWN_SECONDS, HEARTBEAT_TIMEOUT};
 
 /// 倒计时窗口标题（也用于 Win32 查找窗口句柄，必须唯一）
 pub const COUNTDOWN_TITLE: &str = "自动关机守护 - 关机倒计时警告";
@@ -111,7 +111,7 @@ impl Render for CountdownView {
                     // ---- 说明 ----
                     .child(
                         v_flex().gap_1().items_center().child(
-                            Label::new("心跳服务已失联超过 60 秒，服务端可能已断电或离线。")
+                            Label::new(format!("连续 {} 秒未收到有效认证应答，设备可能已断电或无线通信异常。", HEARTBEAT_TIMEOUT.as_secs()))
                                 .text_color(muted),
                         ),
                     )

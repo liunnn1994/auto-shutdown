@@ -5,7 +5,19 @@
 // 预编译静态库 gpui.lib 自带一份 manifest 资源，再嵌一份会因资源
 // ID 冲突（CVT1100 duplicate resource）导致链接失败。
 // 开机自启动走任务计划程序（普通用户即可创建），见 autostart.rs。
+#[path = "build/key_config.rs"]
+mod key_config;
+
 fn main() {
+    println!("cargo:rerun-if-changed=.env.local");
+    let root = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let config = std::fs::read_to_string(root.join(".env.local"))
+        .expect("需要本地 .env.local；参照 .env.example 配置 AUTO_SHUTDOWN_RADIO_KEY");
+    let key = key_config::parse(&config).unwrap_or_else(|error| panic!("{error}"));
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("radio_key.rs"), format!("pub const RADIO_KEY: [u8; 32] = {key:?};\n"))
+        .expect("无法生成构建密钥");
+
     // 图标缺失时给出提示而不中断构建
     let icon = std::path::Path::new("assets/app.ico");
     if icon.exists() {

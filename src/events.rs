@@ -4,37 +4,35 @@
 //! - [`MonitorCommand`]: UI 发给心跳监控线程的**命令**。
 
 use futures::channel::mpsc::UnboundedSender;
-use serde::{Deserialize, Serialize};
 
 /// 心跳的整体状态，用于主界面展示
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeartStatus {
-    /// 尚未配置服务地址
+    /// 尚未选择广播设备
     NotConfigured,
-    /// 已配置地址，但从未连通过（首次连通后才会进入“戒备”状态）
+    /// 已选择设备，但从未认证成功（成功后才进入戒备状态）
     Waiting,
     /// 心跳服务在线
     Connected,
+    /// 首次认证失败，尚未达到关机阈值
+    Unconfirmed,
     /// 心跳丢失，服务可能已离线
     Lost,
 }
 
-/// 局域网内发现的心跳服务设备
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// 通过无线广播认证发现的设备
+#[derive(Clone, Debug)]
 pub struct Device {
-    /// 设备名称（来自 announce 报文）
+    /// 设备名称和信号强度
     pub name: String,
-    /// WebSocket 地址（"ip:port" 形式，不含 scheme）
+    /// 广播设备标识（radio://芯片ID）
     pub addr: String,
-    /// 设备身份（ESP 用芯片 ID），旧固件可能不上报
-    #[serde(default)]
-    pub id: Option<String>,
 }
 
 /// 倒计时弹窗上的用户选择
 #[derive(Clone, Copy, Debug)]
 pub enum CountdownChoice {
-    /// 取消关机（60 秒后若心跳仍未恢复，再次弹出）
+    /// 取消本次关机，认证恢复前不再提醒
     Cancel,
     /// 稍后关机（30 秒后再次弹出倒计时）
     Later,
@@ -43,13 +41,13 @@ pub enum CountdownChoice {
 /// 发往 UI 主循环的事件
 #[derive(Debug)]
 pub enum AppEvent {
-    /// 心跳恢复（收到一次成功的 pong）
+    /// 收到本轮挑战的有效认证应答
     HeartbeatOk,
-    /// 心跳丢失超过阈值，且主动探测确认设备无应答，服务可能已物理离线
+    /// 最新一轮认证失败，但尚未达到失联关机阈值
+    HeartbeatUnconfirmed { detail: String },
+    /// 超过阈值未收到认证应答，按失联策略处理
     HeartbeatLost { detail: String },
-    /// 监控线程发现设备换了 IP（DHCP 重新分配），已自动切换监控目标
-    TargetAutoChanged { old: String, new: String },
-    /// 局域网扫描完成
+    /// 无线广播扫描完成
     ScanFinished(Result<Vec<Device>, String>),
     /// 手动“测试”完成
     TestFinished(Result<String, String>),
@@ -72,9 +70,9 @@ pub enum AppEvent {
 pub enum MonitorCommand {
     /// 设置监控目标；None 表示停止监控（例如用户尚未配置）
     SetTarget(Option<String>),
-    /// 扫描局域网内的心跳服务
+    /// 扫描并认证开发板广播
     Scan,
-    /// 手动测试某个地址的连通性
+    /// 手动测试某个广播设备的认证应答
     Test(String),
 }
 

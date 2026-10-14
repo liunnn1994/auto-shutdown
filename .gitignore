@@ -1,4 +1,6 @@
 /target
+/.env.local
+/ESP8266/radio_key.local.h
 python/__pycache__
 node_modules
 ESP8266/web/dist
