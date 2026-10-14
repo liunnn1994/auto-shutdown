@@ -57,6 +57,7 @@ static const char DEV_NAME[]    = "heartbeat-server"; // announce 中展示的�
 static const uint16_t WEB_PORT  = 80;                 // Web 管理界面端口
 static const uint16_t WS_PORT   = 8123;               // WebSocket 心跳端口
 static const uint16_t UDP_PORT  = 8124;               // UDP 发现端口
+static const char FIRMWARE_REV[] = "wifi-recovery-2";
 
 // ---------------------------------------------------------------------------
 // 协议常量与缓冲区
@@ -87,6 +88,9 @@ static uint32_t g_hb_count   = 0;      // 成功应答的心跳次数
 static uint32_t g_bad_count  = 0;      // 丢弃的非法报文数
 static uint32_t g_last_hb_ms = 0;
 static char     g_last_client[16] = "-";
+static uint32_t g_ws_aborts = 0;
+static uint32_t g_min_heap = UINT32_MAX;
+static const uint32_t WS_MIN_HEAP = 20000;
 
 static char    g_session[17] = "";     // 当前管理员会话令牌（空 = 未登录）
 static bool    g_ap_active  = false;
@@ -103,6 +107,13 @@ static WiFiEventHandler g_wifi_disconnect_handler; // 必须保留，否则回�
 static uint8_t g_wifi_reason = 0;
 static uint32_t g_wifi_disconnects = 0;
 static bool g_wifi_event_pending = false;
+static uint32_t g_wifi_event_log_ms = 0;
+static uint32_t g_wifi_no_ap = 0;
+static uint32_t g_wifi_beacon_timeouts = 0;
+static uint8_t g_outage_reason = 0;
+static int32_t g_last_rssi = 0;
+static uint8_t g_last_channel = 0;
+static char g_last_bssid[18] = "-";
 
 // 单线程事件循环使用的工作缓冲区（避免占用栈空间）
 static uint8_t g_ws_payload[B64_MAX + 2]; // WS 帧载荷（即 Base64 加密帧文本）
@@ -393,7 +404,12 @@ static bool read_exact(WiFiClient &c, uint8_t *dst, size_t n, uint32_t timeout_m
     if (millis() - t0 > timeout_ms) return false;
     int v = c.read();
     if (v >= 0) dst[got++] = (uint8_t)v;
-    else { udp_tick(); yield(); }
+    else {
+      // 对端已退出时不再空等 5 秒；让主循环及时处理掉线和主动重连。
+      if (!c.connected() || WiFi.status() != WL_CONNECTED) return false;
+      udp_tick();
+      yield();
+    }
   }
   return true;
 }
@@ -448,7 +464,21 @@ static bool read_ws_frame(WiFiClient &c, uint8_t *payload, size_t cap,
   return true;
 }
 
+// 普通 stop() 会留下 TCP CLOSE_WAIT/TIME_WAIT 资源。低内存时采用核心
+// 提供的 abort()（先尝试发送输出缓冲，再释放连接），避免短连接耗尽堆。
+static void close_ws_client(WiFiClient &c, bool invalid = false) {
+  uint32_t heap = ESP.getFreeHeap();
+  if (heap < g_min_heap) g_min_heap = heap;
+  if (invalid || heap < WS_MIN_HEAP) {
+    ++g_ws_aborts;
+    c.abort();
+  } else {
+    c.stop(300);
+  }
+}
+
 static void serve_ws_client(WiFiClient &c) {
+  c.setTimeout(1000); // 写入阻塞也有上限，避免拖住整个网络管理循环
   // ---- 1. 读 HTTP 升级握手请求（直到 \r\n\r\n） ----
   static char req[768];
   size_t rl = 0;
@@ -456,27 +486,30 @@ static void serve_ws_client(WiFiClient &c) {
   for (;;) {
     int v = c.read();
     if (v >= 0) {
-      if (rl < sizeof(req) - 1) req[rl++] = (char)v;
-      t0 = millis();
-    } else if (millis() - t0 > 5000) {
-      c.stop(); return;
+      if (rl >= sizeof(req) - 1) { close_ws_client(c, true); return; }
+      req[rl++] = (char)v;
     }
+    // 总握手期限，不允许不断发送零散字节使超时无限延长。
+    if (millis() - t0 > 5000) { close_ws_client(c, true); return; }
     if (rl >= 4 && memcmp(req + rl - 4, "\r\n\r\n", 4) == 0) break;
-    if (!c.connected() && !c.available()) { c.stop(); return; }
+    if ((!c.connected() && !c.available()) || WiFi.status() != WL_CONNECTED) {
+      close_ws_client(c, true); return;
+    }
+    udp_tick();
     yield();
   }
   req[rl] = 0;
 
   // ---- 2. 计算 Sec-WebSocket-Accept 并回复 101 ----
   const char *kp = ci_strstr(req, "sec-websocket-key:");
-  if (!kp) { c.stop(); return; }
+  if (!kp) { close_ws_client(c, true); return; }
   kp += strlen("sec-websocket-key:");
   while (*kp == ' ' || *kp == '\t') kp++;
   char key[64];
   size_t ki = 0;
   while (*kp && *kp != '\r' && *kp != '\n' && ki + 1 < sizeof(key)) key[ki++] = *kp++;
   key[ki] = 0;
-  if (ki == 0) { c.stop(); return; }
+  if (ki == 0) { close_ws_client(c, true); return; }
 
   char accept[32];
   ws_accept(key, accept);
@@ -487,10 +520,12 @@ static void serve_ws_client(WiFiClient &c) {
            "Connection: Upgrade\r\n"
            "Sec-WebSocket-Accept: %s\r\n\r\n",
            accept);
-  c.print(resp);
+  if (c.print(resp) != strlen(resp)) { close_ws_client(c, true); return; }
 
   // ---- 3. 帧循环：解密 ping -> 回加密 pong ----
-  for (;;) {
+  // PC 每次连接只交换一次心跳；限制整个会话，防止闲置客户端占住服务。
+  uint32_t session_ms = millis();
+  while (millis() - session_ms < 10000 && WiFi.status() == WL_CONNECTED) {
     size_t plen;
     uint8_t opcode;
     if (!read_ws_frame(c, g_ws_payload, sizeof(g_ws_payload) - 1, &plen, &opcode)) break;
@@ -531,7 +566,7 @@ static void serve_ws_client(WiFiClient &c) {
       Serial.printf("[hb] %lu  from %s\n", g_hb_count, g_last_client);
     }
   }
-  c.stop();
+  close_ws_client(c);
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +744,7 @@ static void handle_wifi() {
   // 立即尝试连接（保持当前 STA/AP 模式组合）
   g_sta_reset_pending = false;
   WiFi.mode(g_ap_active ? WIFI_AP_STA : WIFI_STA);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
   if (pass.length()) WiFi.begin(g_cfg.ssid, g_cfg.pass);
   else               WiFi.begin(g_cfg.ssid);
   g_sta_since = millis();
@@ -829,6 +865,7 @@ static void start_ap() {
   char ap_ssid[32];
   snprintf(ap_ssid, sizeof(ap_ssid), "auto-shutdown-%06X", ESP.getChipId());
   WiFi.mode(g_cfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
   WiFi.softAP(ap_ssid); // 开放网络：配置操作由管理员登录保护
   g_dns.start(53, "*", WiFi.softAPIP()); // 劫持所有域名解析 -> Captive Portal
   g_ap_active = true;
@@ -846,6 +883,16 @@ void setup() {
   Serial.println("auto-shutdown heartbeat server (ESP8266)");
   // 复位原因随首条日志上报：PC 端可据此判断设备是否发生过意外重启
   log_evt("info", "boot, reset reason: %s", ESP.getResetReason().c_str());
+  log_evt("info", "firmware=%s built=%s %s", FIRMWARE_REV, __DATE__, __TIME__);
+  const rst_info *reset = ESP.getResetInfoPtr();
+  if (reset && (reset->reason == REASON_EXCEPTION_RST || reset->reason == REASON_SOFT_WDT_RST)) {
+    log_evt("error", "crash: cause=%lu epc1=%08lx addr=%08lx",
+            (unsigned long)reset->exccause, (unsigned long)reset->epc1,
+            (unsigned long)reset->excvaddr);
+    log_evt("error", "crash: epc2=%08lx epc3=%08lx depc=%08lx",
+            (unsigned long)reset->epc2, (unsigned long)reset->epc3,
+            (unsigned long)reset->depc);
+  }
 
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH); // 板载 LED 低有效，先熄灭
@@ -858,6 +905,8 @@ void setup() {
       [](const WiFiEventStationModeDisconnected &event) {
         g_wifi_reason = (uint8_t)event.reason;
         ++g_wifi_disconnects;
+        if (event.reason == REASON_NO_AP_FOUND) ++g_wifi_no_ap;
+        if (event.reason == REASON_BEACON_TIMEOUT) ++g_wifi_beacon_timeouts;
         g_wifi_event_pending = true;
       });
 
@@ -898,11 +947,16 @@ void loop() {
 
   bool conn = WiFi.status() == WL_CONNECTED;
   static bool was_conn = false;
-  if (g_wifi_event_pending) {
+  uint32_t heap = ESP.getFreeHeap();
+  if (heap < g_min_heap) g_min_heap = heap;
+  // SDK 每几秒都会重复报告失败；聚合限流，避免冲掉掉线/重试日志。
+  if (g_wifi_event_pending && (conn != was_conn || millis() - g_wifi_event_log_ms >= 30000)) {
     g_wifi_event_pending = false;
-    log_evt("warn", "wifi event: reason=%u status=%d mode=%d disconnects=%lu",
+    g_wifi_event_log_ms = millis();
+    log_evt("warn", "wifi event: reason=%u status=%d mode=%d count=%lu noap=%lu beacon=%lu",
             g_wifi_reason, (int)WiFi.status(), (int)WiFi.getMode(),
-            (unsigned long)g_wifi_disconnects);
+            (unsigned long)g_wifi_disconnects, (unsigned long)g_wifi_no_ap,
+            (unsigned long)g_wifi_beacon_timeouts);
   }
   if (conn && !was_conn) {
     g_sta_ok_ms = millis();
@@ -910,6 +964,8 @@ void loop() {
             WiFi.localIP().toString().c_str(),
             (unsigned long)((g_sta_ok_ms - g_sta_since) / 1000),
             (unsigned long)g_sta_retries, (unsigned long)g_sta_resets, g_wifi_reason);
+    log_evt("info", "wifi link: rssi=%ld ch=%d bssid=%s first_reason=%u",
+            (long)WiFi.RSSI(), WiFi.channel(), WiFi.BSSIDstr().c_str(), g_outage_reason);
     // 网络接口恢复后重新绑定监听服务。
     g_ws_server.begin();
     g_ws_server.setNoDelay(true);
@@ -918,14 +974,24 @@ void loop() {
     g_web.begin(WEB_PORT);
   }
   if (!conn && was_conn) {
+    g_outage_reason = g_wifi_reason; // 保留首次掉线原因，不被主动断开/重试覆盖
     g_sta_since = millis(); // 本次掉线重新计时，而不是沿用启动时刻
     g_sta_retry_ms = g_sta_reset_ms = g_sta_since;
     g_sta_retries = g_sta_resets = 0;
     g_ws_server.stop();
     g_udp.stop();
     log_evt("warn", "wifi disconnected, reason=%u status=%d", g_wifi_reason, (int)WiFi.status());
+    log_evt("warn", "wifi last link: rssi=%ld ch=%u bssid=%s",
+            (long)g_last_rssi, g_last_channel, g_last_bssid);
   }
   was_conn = conn;
+  if (conn) {
+    g_last_rssi = WiFi.RSSI();
+    g_last_channel = (uint8_t)WiFi.channel();
+    const uint8_t *bssid = WiFi.BSSID();
+    if (bssid) snprintf(g_last_bssid, sizeof(g_last_bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
+                        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+  }
 
   if (g_cfg.ssid[0]) {
     if (conn) {
@@ -934,6 +1000,7 @@ void loop() {
         g_dns.stop();
         WiFi.softAPdisconnect(true);
         WiFi.mode(WIFI_STA);
+        WiFi.setSleepMode(WIFI_NONE_SLEEP);
         g_ap_active = false;
         log_evt("info", "config AP closed");
         Serial.println("[ap] closed");
@@ -985,6 +1052,11 @@ void loop() {
     g_last_stat_ms = millis();
     log_evt("info", "stats: hb=%lu bad=%lu heap=%u", (unsigned long)g_hb_count,
             (unsigned long)g_bad_count, (unsigned)ESP.getFreeHeap());
+    log_evt("info", "memory: min=%lu maxblock=%lu frag=%u%% ws_aborts=%lu",
+            (unsigned long)g_min_heap, (unsigned long)ESP.getMaxFreeBlockSize(),
+            (unsigned)ESP.getHeapFragmentation(), (unsigned long)g_ws_aborts);
+    log_evt("info", "wifi stats: rssi=%ld ch=%u bssid=%s", (long)g_last_rssi,
+            g_last_channel, g_last_bssid);
   }
 
   // 板载 LED：未联网闪烁；联网后每次心跳亮一下
