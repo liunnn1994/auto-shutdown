@@ -68,6 +68,8 @@ pub enum AppEvent {
 /// 发往心跳监控线程的命令
 #[derive(Debug)]
 pub enum MonitorCommand {
+    /// 更新失联阈值，保留最后成功认证时间和本次失联状态。
+    SetTimeout(u32),
     /// 设置监控目标；None 表示停止监控（例如用户尚未配置）
     SetTarget(Option<String>),
     /// 扫描并认证开发板广播

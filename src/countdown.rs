@@ -1,8 +1,8 @@
 //! # 关机倒计时弹窗
 //!
-//! 心跳服务失联（连续 180 秒未认证成功）时弹出的**置顶**独立窗口：
+//! 心跳服务失联（超过配置的失联时长未认证成功）时弹出的**置顶**独立窗口：
 //!
-//! - 一个不断刷新的 60 秒倒计时（`ProgressCircle` 环形进度 + 剩余秒数）；
+//! - 一个按配置时长刷新的倒计时（`ProgressCircle` 环形进度 + 剩余秒数）；
 //! - 三个标准 `Button`：
 //!   - **立即关机**：马上执行关机命令；
 //!   - **取消关机**：关闭弹窗，心跳恢复后重新开始监测；
@@ -25,11 +25,11 @@ use gpui_kit::component::{ActiveTheme, Icon, IconName, Root, Sizable as _, Size}
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Context, FontWeight, ParentElement as _, Render, Styled as _, Window,
-    WindowBounds, WindowOptions, div, px, size,
+    WindowBounds, WindowOptions, px, size,
 };
 
 use crate::events::{AppEvent, CountdownChoice};
-use crate::protocol::{COUNTDOWN_SECONDS, HEARTBEAT_TIMEOUT};
+use crate::config::Settings;
 
 /// 倒计时窗口标题（也用于 Win32 查找窗口句柄，必须唯一）
 pub const COUNTDOWN_TITLE: &str = "自动关机守护 - 关机倒计时警告";
@@ -39,12 +39,13 @@ const WINDOW_SIZE: (f32, f32) = (520., 360.);
 pub struct CountdownView {
     /// 剩余秒数（每秒 -1，归零触发关机）
     remaining: u32,
+    settings: Settings,
     /// 事件通道（按钮点击 / 归零关机都从这里发给主循环）
     events: UnboundedSender<AppEvent>,
 }
 
 impl CountdownView {
-    pub fn new(events: UnboundedSender<AppEvent>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(events: UnboundedSender<AppEvent>, settings: Settings, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         // 每秒 tick 一次：递减 remaining 并刷新界面；归零后通知主循环关机。
         let tx = events.clone();
         cx.spawn(async move |weak, cx| {
@@ -67,7 +68,8 @@ impl CountdownView {
         .detach();
 
         Self {
-            remaining: COUNTDOWN_SECONDS as u32,
+            remaining: settings.countdown_seconds,
+            settings,
             events,
         }
     }
@@ -78,7 +80,7 @@ impl Render for CountdownView {
         let theme = cx.theme();
         let danger = theme.danger;
         let muted = theme.muted_foreground;
-        let pct = self.remaining as f32 / COUNTDOWN_SECONDS as f32 * 100.;
+        let pct = self.remaining as f32 / self.settings.countdown_seconds as f32 * 100.;
 
         // 各按钮共用的事件发送端（闭包按值捕获，逐个克隆）
         let tx_shutdown = self.events.clone();
@@ -111,7 +113,7 @@ impl Render for CountdownView {
                     // ---- 说明 ----
                     .child(
                         v_flex().gap_1().items_center().child(
-                            Label::new(format!("连续 {} 秒未收到有效认证应答，设备可能已断电或无线通信异常。", HEARTBEAT_TIMEOUT.as_secs()))
+                            Label::new(format!("连续 {} 秒未收到有效认证应答，设备可能已断电或无线通信异常。", self.settings.heartbeat_timeout_seconds))
                                 .text_color(muted),
                         ),
                     )
@@ -123,11 +125,10 @@ impl Render for CountdownView {
                             .value(pct)
                             .child(
                                 v_flex().items_center().child(
-                                    div()
+                                    Label::new(format!("{}", self.remaining))
                                         .text_size(px(40.))
                                         .font_weight(FontWeight::BOLD)
-                                        .text_color(danger)
-                                        .child(format!("{}", self.remaining)),
+                                        .text_color(danger),
                                 ),
                             ),
                     )
@@ -172,6 +173,7 @@ impl Render for CountdownView {
 /// 返回窗口根视图（Root）的句柄，用于之后关闭该窗口。
 pub fn open_countdown_window(
     events: UnboundedSender<AppEvent>,
+    settings: Settings,
     cx: &mut App,
 ) -> gpui_kit::WindowHandle<Root> {
     let bounds = WindowBounds::centered(size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
@@ -193,7 +195,7 @@ pub fn open_countdown_window(
     };
 
     cx.open_window(options, |window, cx| {
-        let view: gpui_kit::AnyView = cx.new(|cx| CountdownView::new(events, window, cx)).into();
+        let view: gpui_kit::AnyView = cx.new(|cx| CountdownView::new(events, settings, window, cx)).into();
         cx.new(|cx| Root::new(view, window, cx))
     })
     .expect("打开倒计时窗口失败")

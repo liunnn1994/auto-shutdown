@@ -2,7 +2,7 @@
 //!
 //! [`AppModel`] 同时承担两个角色：
 //!
-//! 1. **主界面视图**：状态展示、广播设备配置（扫描 / 测试 / 保存）；
+//! 1. **主界面视图**：状态展示、广播设备配置（扫描 / 测试 / 启动）；
 //! 2. **事件主控**：接收托盘、心跳监控线程、倒计时弹窗发来的
 //!    [`AppEvent`]，驱动整个应用的状态机（弹倒计时、关机、托盘显隐等）。
 
@@ -11,28 +11,35 @@ use std::time::{Duration, Instant};
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::alert::Alert;
-use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::collapsible::Collapsible;
-use gpui_kit::component::group_box::GroupBox;
+use gpui_kit::component::form::{Field, Form};
+use gpui_kit::component::group_box::{GroupBox, GroupBoxVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, IconName, Root, Sizable as _, TitleBar};
-use gpui_kit::{AppContext as _, Context, Entity, InteractiveElement as _, StatefulInteractiveElement as _, FontWeight, ParentElement as _, Render, Styled as _, Window, div, px};
+use gpui_kit::component::{
+    ActiveTheme, Disableable as _, Icon, IconName, Root, Sizable as _, TitleBar,
+};
 use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    AppContext as _, Context, Entity, FontWeight, ParentElement as _, Render, Styled as _, Window,
+    px,
+};
 
+use crate::config::{Settings, positive_seconds};
 use crate::countdown;
 use crate::events::{AppEvent, CountdownChoice, EventTx, HeartStatus, MonitorCommand};
-use crate::protocol::{COUNTDOWN_SECONDS, SNOOZE_LATER_SECONDS};
+use crate::protocol::SNOOZE_LATER_SECONDS;
 use crate::win32;
 
 /// 主窗口标题（同时用于 Win32 按标题查找窗口，必须全局唯一）
 pub const MAIN_WINDOW_TITLE: &str = "自动关机守护 - 心跳失联自动关机";
 
 // ---------------------------------------------------------------------------
-// 本软件不持久化监控配置：每次启动重新发现认证广播。
+// 广播设备每次启动重新发现；关机策略独立持久化。
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -46,11 +53,15 @@ pub struct AppModel {
     lost_detail: Option<String>,
     /// 广播设备标识输入框
     input: Entity<InputState>,
+    timeout_input: Entity<InputState>,
+    countdown_input: Entity<InputState>,
+    settings: Settings,
+    settings_hint: Option<(String, bool)>,
     /// 生效中的广播设备标识
     saved_server: Option<String>,
     /// 是否正在扫描广播
     scanning: bool,
-    /// 「服务配置」折叠面板是否展开（默认收起）
+    /// 「配置」折叠面板是否展开（默认收起）
     config_open: bool,
     /// 最近一次“测试”的结果
     test_result: Option<Result<String, String>>,
@@ -74,6 +85,7 @@ impl AppModel {
     pub fn new(
         events: EventTx,
         cmds: UnboundedSender<MonitorCommand>,
+        settings: Settings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -98,9 +110,19 @@ impl AppModel {
         Self {
             status,
             lost_detail: None,
-            input: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("例如: radio://d86071")
+            input: cx.new(|cx| InputState::new(window, cx).placeholder("例如: radio://d86071")),
+            timeout_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(settings.heartbeat_timeout_seconds.to_string())
+                    .validate(|value, _| value.is_empty() || positive_seconds(value).is_some())
             }),
+            countdown_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(settings.countdown_seconds.to_string())
+                    .validate(|value, _| value.is_empty() || positive_seconds(value).is_some())
+            }),
+            settings,
+            settings_hint: None,
             saved_server: None,
             scanning,
             config_open: false,
@@ -126,7 +148,13 @@ impl AppModel {
                 crate::log_warn!("最新广播认证未确认，界面切换为等待确认: {detail}");
                 self.status = HeartStatus::Unconfirmed;
                 self.lost_detail = Some(detail);
-                self.hint = Some(("未收到最新认证应答，正在确认设备状态；持续失联 180 秒后才会启动关机倒计时。".into(), false));
+                self.hint = Some((
+                    format!(
+                        "未收到最新认证应答，正在确认设备状态；持续失联 {} 秒后才会启动关机倒计时。",
+                        self.settings.heartbeat_timeout_seconds
+                    ),
+                    false,
+                ));
                 cx.notify();
             }
             AppEvent::HeartbeatLost { detail } => self.on_heartbeat_lost(detail, cx),
@@ -238,13 +266,15 @@ impl AppModel {
         cx.notify();
     }
 
-    /// 切换监控目标（仅内存生效，不落盘；本软件不持久化任何数据）
+    /// 切换监控目标（仅内存生效，不落盘）
     fn apply_server(&mut self, addr: String) {
         crate::log_info!("监控目标设置为 {addr}（等待首次连通）");
         self.saved_server = Some(addr.clone());
         self.status = HeartStatus::Waiting;
         self.lost_detail = None;
-        let _ = self.cmds.unbounded_send(MonitorCommand::SetTarget(Some(addr)));
+        let _ = self
+            .cmds
+            .unbounded_send(MonitorCommand::SetTarget(Some(addr)));
     }
 
     /// 用户在倒计时弹窗上做出了选择
@@ -254,22 +284,28 @@ impl AppModel {
                 crate::log_info!("用户在倒计时弹窗上选择：取消关机（心跳恢复前不再提醒）");
                 // 取消关机：本次彻底不提醒了。心跳监控线程在“恢复 -> 再次丢失”
                 // 之前不会重复上报丢失事件，因此这里只需关窗，无需定时重弹；
-                // 下次心跳恢复（HeartbeatOk）后自动复位，重新进入 180 秒失联监测。
+                // 下次心跳恢复（HeartbeatOk）后自动复位，重新进入失联监测。
                 self.close_countdown(cx);
                 self.hint = Some((
-                    "已取消本次关机。心跳恢复后会重新开始监测，若再次失联超过 180 秒将再次提醒。".into(),
+                    format!(
+                        "已取消本次关机。心跳恢复后会重新开始监测，若再次失联超过 {} 秒将再次提醒。",
+                        self.settings.heartbeat_timeout_seconds
+                    ),
                     false,
                 ));
             }
             CountdownChoice::Later => {
-                crate::log_info!("用户在倒计时弹窗上选择：稍后关机（{SNOOZE_LATER_SECONDS} 秒后重弹）");
+                crate::log_info!(
+                    "用户在倒计时弹窗上选择：稍后关机（{SNOOZE_LATER_SECONDS} 秒后重弹）"
+                );
                 // 稍后关机：关闭弹窗并安排 30 秒后重新弹出完整倒计时
                 self.close_countdown(cx);
                 self.hint = Some((
                     format!("将在 {SNOOZE_LATER_SECONDS} 秒后再次弹出关机倒计时。"),
                     false,
                 ));
-                self.snooze_until = Some(Instant::now() + Duration::from_secs(SNOOZE_LATER_SECONDS));
+                self.snooze_until =
+                    Some(Instant::now() + Duration::from_secs(SNOOZE_LATER_SECONDS));
                 self.snooze_gen += 1;
                 let snooze_gen = self.snooze_gen;
                 cx.spawn(async move |weak, cx| {
@@ -295,13 +331,17 @@ impl AppModel {
             return;
         }
         if let Some(until) = self.snooze_until
-            && Instant::now() < until {
-                return;
-            }
+            && Instant::now() < until
+        {
+            return;
+        }
         self.snooze_until = None;
-        let handle = countdown::open_countdown_window(self.events.clone(), cx);
+        let handle = countdown::open_countdown_window(self.events.clone(), self.settings, cx);
         self.countdown = Some(handle);
-        crate::log_warn!("已弹出关机倒计时窗口（{COUNTDOWN_SECONDS} 秒）");
+        crate::log_warn!(
+            "已弹出关机倒计时窗口（{} 秒）",
+            self.settings.countdown_seconds
+        );
         // 弹窗时同步主界面的提示
         self.hint = Some(("检测到心跳服务失联，已弹出关机倒计时！".into(), true));
     }
@@ -333,7 +373,53 @@ impl AppModel {
     // 界面按钮回调
     // -----------------------------------------------------------------
 
-    /// “扫描局域网”按钮
+    fn save_settings(&mut self, cx: &mut Context<Self>) {
+        // 已打开的倒计时使用打开时的配置，期间不允许改策略。
+        if self.countdown.is_some() {
+            return;
+        }
+        let timeout = positive_seconds(&self.timeout_input.read(cx).value());
+        let countdown = positive_seconds(&self.countdown_input.read(cx).value());
+        let (Some(timeout), Some(countdown)) = (timeout, countdown) else {
+            self.settings_hint = Some(("请输入大于 0 的整数（最大 4294967295 秒）。".into(), true));
+            cx.notify();
+            return;
+        };
+        let settings = Settings {
+            heartbeat_timeout_seconds: timeout,
+            countdown_seconds: countdown,
+        };
+        if settings == self.settings {
+            self.settings_hint = Some(("配置未修改。".into(), false));
+            cx.notify();
+            return;
+        }
+        match settings.save() {
+            Ok(()) => {
+                self.settings = settings;
+                let _ = self
+                    .cmds
+                    .unbounded_send(MonitorCommand::SetTimeout(timeout));
+                crate::log_info!("已保存关机策略：失联 {timeout} 秒，倒计时 {countdown} 秒");
+                if self.status == HeartStatus::Unconfirmed {
+                    self.hint = Some((
+                        format!(
+                            "未收到最新认证应答，正在确认设备状态；持续失联 {timeout} 秒后才会启动关机倒计时。"
+                        ),
+                        false,
+                    ));
+                }
+                self.settings_hint = Some(("配置已保存并生效。".into(), false));
+            }
+            Err(error) => {
+                crate::log_error!("保存关机策略失败: {error}");
+                self.settings_hint = Some((format!("保存失败，继续使用原配置：{error}"), true));
+            }
+        }
+        cx.notify();
+    }
+
+    /// “扫描开发板”按钮
     fn start_scan(&mut self, cx: &mut Context<Self>) {
         self.scanning = true;
         self.hint = Some(("正在扫描并认证开发板无线广播，请稍候…".into(), false));
@@ -354,8 +440,8 @@ impl AppModel {
         cx.notify();
     }
 
-    /// “保存并启动监控”按钮：写配置文件并切换监控目标
-    fn save_and_start(&mut self, cx: &mut Context<Self>) {
+    /// “启动监控”按钮：切换本次运行的监控目标
+    fn start_monitoring(&mut self, cx: &mut Context<Self>) {
         let addr = self.input.read(cx).value().trim().to_string();
         if addr.is_empty() {
             self.hint = Some(("请先输入广播设备标识".into(), true));
@@ -397,17 +483,24 @@ impl AppModel {
 impl Render for AppModel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui_kit::IntoElement {
         let theme = cx.theme();
-
-        // ---- 状态（图标 + tooltip 文案 + 着色）----
         let (status_text, status_color, status_icon) = match self.status {
-            HeartStatus::NotConfigured => ("尚未选择监控设备", theme.muted_foreground, IconName::Info),
+            HeartStatus::NotConfigured => {
+                ("尚未选择监控设备", theme.muted_foreground, IconName::Info)
+            }
             HeartStatus::Waiting => ("等待首次有效心跳", theme.warning, IconName::BatteryCharging),
             HeartStatus::Connected => ("服务在线，心跳正常", theme.success, IconName::CircleCheck),
-            HeartStatus::Unconfirmed => ("未收到认证应答，正在确认设备状态", theme.warning, IconName::Info),
-            HeartStatus::Lost => ("心跳丢失！服务可能已离线", theme.danger, IconName::TriangleAlert),
+            HeartStatus::Unconfirmed => (
+                "未收到认证应答，正在确认设备状态",
+                theme.warning,
+                IconName::Info,
+            ),
+            HeartStatus::Lost => (
+                "心跳丢失！服务可能已离线",
+                theme.danger,
+                IconName::TriangleAlert,
+            ),
         };
-
-        // ---- 提示信息（Alert 组件，按严重程度着色）----
+        let countdown_active = self.countdown.is_some();
         let hint_el = self.hint.as_ref().map(|(text, is_err)| {
             if *is_err {
                 Alert::error("hint", text.clone())
@@ -416,230 +509,132 @@ impl Render for AppModel {
             }
             .small()
         });
-
-        // ---- 测试结果（Alert 组件）----
-        let test_el = self.test_result.as_ref().map(|r| match r {
-            Ok(msg) => Alert::success("test-result", msg.clone()).small(),
-            Err(msg) => Alert::error("test-result", msg.clone()).small(),
+        let test_el = self.test_result.as_ref().map(|result| match result {
+            Ok(message) => Alert::success("test-result", message.clone()).small(),
+            Err(message) => Alert::error("test-result", message.clone()).small(),
         });
-
-        // ---- 丢失原因 ----
-        let lost_el = self.lost_detail.as_ref().map(|d| {
-            Alert::error("lost-detail", format!("丢失原因: {d}")).small()
+        let lost_el = self
+            .lost_detail
+            .as_ref()
+            .map(|detail| Alert::error("lost-detail", format!("丢失原因: {detail}")).small());
+        let settings_el = self.settings_hint.as_ref().map(|(message, error)| {
+            if *error {
+                Alert::error("settings-hint", message.clone())
+            } else {
+                Alert::info("settings-hint", message.clone())
+            }
+            .small()
         });
 
         v_flex()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
-            // ---- 自绘标题栏（拖拽区 + 最小化/关闭按钮）----
-            .child(TitleBar::new().child(div().ml_3().text_size(px(13.)).child("自动关机守护")))
+            .child(TitleBar::new().child(Label::new("自动关机守护").ml_3().text_size(px(13.))))
             .child(
                 v_flex()
                     .flex_1()
                     .p_4()
                     .gap_4()
-                    // 内容超出窗口高度时出现滚动条，不用手动拉大窗口
                     .overflow_y_scrollbar()
-                    // ---- 顶部：监控目标卡片（左：目标地址；右：状态图标）----
                     .child(
-                        div()
-                            .border_1()
-                            .border_color(theme.border)
-                            .rounded(px(10.))
-                            .p_4()
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .items_center()
-                                    .child(
-                                        v_flex()
-                                            .gap_0p5()
-                                            .child(
-                                                Label::new("监控目标")
-                                                    .text_color(theme.muted_foreground)
-                                                    .text_size(px(12.)),
-                                            )
-                                            .child(
-                                                Label::new(
-                                                    self.saved_server
-                                                        .as_deref()
-                                                        .unwrap_or("尚未配置"),
-                                                )
-                                                .text_size(px(18.))
-                                                .font_weight(FontWeight::BOLD),
-                                            ),
-                                    )
-                                    .child(
-                                        // 图标按钮承载状态：颜色随状态变化，悬停 tooltip 显示具体文案
-                                        Button::new("status")
-                                            .custom(
-                                                ButtonCustomVariant::new(cx)
-                                                    .foreground(status_color)
-                                                    .hover(theme.transparent),
-                                            )
-                                            .icon(status_icon)
-                                            .tooltip(status_text),
-                                    ),
-                            ),
+                        GroupBox::new().id("monitor-target").outline().child(
+                            h_flex().justify_between().items_center()
+                                .child(v_flex().gap_1()
+                                    .child(Label::new("监控目标").text_color(theme.muted_foreground).text_size(px(12.)))
+                                    .child(Label::new(self.saved_server.as_deref().unwrap_or("尚未选择监控设备").to_string())
+                                        .text_size(px(18.)).font_weight(FontWeight::BOLD)))
+                                .child(Button::new("status").ghost().icon(Icon::new(status_icon).text_color(status_color)).tooltip(status_text))
+                        )
                     )
-                    .when_some(lost_el, |el, a| el.child(a))
-                    // ---- 开机启动开关（与托盘菜单的“开机启动”为同一功能）----
+                    .when_some(lost_el, |element, alert| element.child(alert))
                     .child(
-                        div()
-                            .border_1()
-                            .border_color(theme.border)
-                            .rounded(px(10.))
-                            .px_4()
-                            .py_3()
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .items_center()
-                                    .child(
-                                        v_flex()
-                                            .gap_0p5()
-                                            .child(
-                                                Label::new("开机启动")
-                                                    .text_size(px(14.))
-                                                    .font_weight(FontWeight::MEDIUM),
-                                            )
-                                            .child(
-                                                Label::new(
-                                                    "登录 Windows 后自动在后台运行（写入任务计划程序，无需管理员权限）",
-                                                )
-                                                .text_color(theme.muted_foreground)
-                                                .text_size(px(12.)),
-                                            ),
-                                    )
-                                    .child(
-                                        Switch::new("autostart-switch")
-                                            .checked(self.autostart)
-                                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                                this.toggle_autostart(*checked, cx);
-                                            })),
-                                    ),
-                            ),
+                        GroupBox::new().id("autostart-group").outline().child(
+                            h_flex().w_full().justify_between().items_center().gap_3()
+                                .child(v_flex().flex_1().min_w_0().gap_1()
+                                    .child(Label::new("开机启动"))
+                                    .child(Label::new("登录 Windows 后自动在后台运行（写入任务计划程序，无需管理员权限）")
+                                        .text_color(theme.muted_foreground).text_size(px(12.))))
+                                .child(Switch::new("autostart-switch").checked(self.autostart)
+                                    .on_click(cx.listener(|this, checked: &bool, _, cx| this.toggle_autostart(*checked, cx))))
+                        )
                     )
-                    // ---- 服务配置（Collapsible，默认收起，点击触发行展开/收起）----
                     .child(
-                        Collapsible::new()
-                            .open(self.config_open)
-                            .border_1()
-                            .border_color(theme.border)
-                            .rounded(px(10.))
-                            .overflow_hidden()
-                            // 触发行
-                            .child(
-                                div()
-                                    .id("config-trigger")
-                                    .cursor_pointer()
-                                    .p_3()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.config_open = !this.config_open;
-                                        cx.notify();
-                                    }))
-                                    .child(
-                                        h_flex()
-                                            .justify_between()
-                                            .items_center()
-                                            .child(
-                                                    Label::new("设备配置")
-                                                    .text_size(px(14.))
-                                                    .font_weight(FontWeight::MEDIUM),
-                                            )
-                                            .child(
-                                                Icon::new(if self.config_open {
-                                                    IconName::ChevronUp
-                                                } else {
-                                                    IconName::ChevronDown
-                                                })
-                                                .text_color(theme.muted_foreground),
-                                            ),
-                                    ),
-                            )
-                            // 展开内容
+                        Collapsible::new().open(self.config_open)
+                            .child(Button::new("config-trigger").outline().w_full().h(px(44.)).px_4()
+                                .accessibility_label("配置")
+                                .child(h_flex().w_full().justify_between().items_center()
+                                    .child(Label::new("配置"))
+                                    .child(Icon::new(if self.config_open { IconName::ChevronUp } else { IconName::ChevronDown })
+                                        .text_color(theme.muted_foreground)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.config_open = !this.config_open;
+                                    cx.notify();
+                                })))
                             .content(
-                                div()
-                                    .px_3()
-                                    .pb_3()
+                                v_flex().gap_4().pt_3()
                                     .child(
-                                        h_flex()
-                                            .gap_2()
-                                            .items_center()
-                                            .child(
-                                                div().flex_1().child(Input::new(&self.input).small()),
-                                            )
-                                            .child(
-                                                Button::new("scan")
-                                                    .small()
-                                                    .label(if self.scanning {
-                                                        "扫描中…"
-                                                    } else {
-                                                        "扫描开发板"
-                                                    })
-                                                    .disabled(self.scanning)
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.start_scan(cx)
-                                                    })),
-                                            )
-                                            .child(
-                                                Button::new("test")
-                                                    .small()
-                                                    .label("测试")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.start_test(cx)
-                                                    })),
-                                            )
-                                            .child(
-                                                Button::new("save")
-                                                    .small()
-                                                    .primary()
-                                                    .label("保存并启动监控")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.save_and_start(cx)
-                                                    })),
-                                            ),
-                                    ),
-                            ),
+                                        GroupBox::new().id("device-config").title("设备配置").outline().child(
+                                            Form::vertical().small()
+                                                .child(Field::new().label_fn(|_, cx| {
+                                                    h_flex().items_center().gap_1()
+                                                        .child(Label::new("广播设备标识"))
+                                                        .child(Button::new("device-address-help").ghost().xsmall()
+                                                            .icon(Icon::new(gpui_kit::assets::IconName::CircleQuestionMark)
+                                                                .text_color(cx.theme().muted_foreground))
+                                                            .accessibility_label("广播设备标识说明")
+                                                            .tooltip("地址不会保存，重启后重新扫描，避免继续监控旧设备。"))
+                                                })
+                                                    .child(Input::new(&self.input).small()))
+                                                .footer(h_flex().gap_2()
+                                                    .child(Button::new("scan").small()
+                                                        .label(if self.scanning { "扫描中…" } else { "扫描开发板" })
+                                                        .disabled(self.scanning)
+                                                        .on_click(cx.listener(|this, _, _, cx| this.start_scan(cx))))
+                                                    .child(Button::new("test").small().label("测试")
+                                                        .on_click(cx.listener(|this, _, _, cx| this.start_test(cx))))
+                                                    .child(Button::new("start-monitoring").small().label("启动监控")
+                                                        .on_click(cx.listener(|this, _, _, cx| this.start_monitoring(cx)))))
+                                        )
+                                    )
+                                    .when_some(test_el, |element, alert| element.child(alert))
+                                    .child(
+                                        GroupBox::new().id("shutdown-settings").title("关机策略").outline().child(
+                                            Form::horizontal().small()
+                                                .child(Field::new().label("失联超时（秒）")
+                                                    .child(Input::new(&self.timeout_input).small().disabled(countdown_active)))
+                                                .child(Field::new().label("关机倒计时（秒）")
+                                                    .child(Input::new(&self.countdown_input).small().disabled(countdown_active)))
+                                        ).footer(if countdown_active {
+                                            "倒计时进行中，暂不可修改关机策略。"
+                                        } else {
+                                            "请输入大于 0 的整数，点击保存后生效。"
+                                        })
+                                    )
+                                    .when_some(settings_el, |element, alert| element.child(alert))
+                                    .child(h_flex().justify_end()
+                                        .child(Button::new("save-settings").small().primary().label("保存")
+                                            .disabled(countdown_active)
+                                            .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx)))))
+                            )
                     )
-                    .when_some(hint_el, |el, a| el.child(a))
-                    .when_some(test_el, |el, a| el.child(a))
-                    // ---- 使用说明 ----
+                    .when_some(hint_el, |element, alert| element.child(alert))
                     .child(
-                        GroupBox::new().title("使用说明").child(
-                            v_flex()
-                                .gap_1()
-                                .child(
-                                    Label::new("1. 开发板插在普通市电上，电脑由 UPS 供电；开发板广播无需连接路由器；")
-                                        .text_color(theme.muted_foreground)
-                                        .text_size(px(12.)),
-                                )
-                                .child(
-                                    Label::new("2. 电脑周期扫描无线广播，通过随机挑战认证在线状态，不切换当前 Wi-Fi；")
-                                        .text_color(theme.muted_foreground)
-                                        .text_size(px(12.)),
-                                )
-                                .child(
-                                    Label::new("3. 如果连续 180 秒没有有效应答，按失联策略弹出 60 秒关机倒计时；")
-                                        .text_color(theme.muted_foreground)
-                                        .text_size(px(12.)),
-                                )
-                                .child(
-                                    Label::new("4. 倒计时无人干预会自动关机；也可选择立即关机 / 取消 / 稍后（30 秒后再次提醒）。")
-                                        .text_color(theme.muted_foreground)
-                                        .text_size(px(12.)),
-                                )
-                                .child(
-                                    Separator::horizontal(),
-                                )
-                                .child(
-                                    Label::new("提示: 关闭或最小化窗口都会收到托盘；右键托盘图标可显示窗口或退出。")
-                                        .text_color(theme.muted_foreground)
-                                        .text_size(px(12.)),
-                                ),
-                        ),
-                    ),
+                        GroupBox::new().id("instructions").title("使用说明").child(
+                            v_flex().gap_1()
+                                .child(Label::new("1. 开发板插在普通市电上，电脑由 UPS 供电；开发板广播无需连接路由器；")
+                                    .text_color(theme.muted_foreground).text_size(px(12.)))
+                                .child(Label::new("2. 电脑周期扫描无线广播，通过随机挑战认证在线状态，不切换当前 Wi-Fi；")
+                                    .text_color(theme.muted_foreground).text_size(px(12.)))
+                                .child(Label::new(format!("3. 如果连续 {} 秒没有有效应答，按失联策略弹出 {} 秒关机倒计时；", self.settings.heartbeat_timeout_seconds, self.settings.countdown_seconds))
+                                    .text_color(theme.muted_foreground).text_size(px(12.)))
+                                .child(Label::new("4. 倒计时无人干预会自动关机；也可选择立即关机 / 取消 / 稍后（30 秒后再次提醒）。")
+                                    .text_color(theme.muted_foreground).text_size(px(12.)))
+                                .child(Separator::horizontal())
+                                .child(Label::new("提示: 关闭或最小化窗口都会收进托盘；右键托盘图标可显示窗口或退出。")
+                                    .text_color(theme.muted_foreground).text_size(px(12.)))
+                        )
+                    )
             )
     }
 }

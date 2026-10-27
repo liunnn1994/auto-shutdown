@@ -5,7 +5,7 @@
 //! 1. 插在市电上的 ESP8266 持续广播，PC 默认通过无线扫描随机挑战认证其在线状态；
 //! 2. 本软件在 PC 上运行：主界面负责配置与状态展示，托盘常驻，
 //!    广播监控每轮结束等待 15 秒；
-//! 3. 若连续 180 秒心跳无响应 → 按失联策略弹出置顶的 60 秒
+//! 3. 默认连续 60 秒心跳无响应 → 按失联策略弹出置顶的 60 秒
 //!    关机倒计时，倒计时结束无人干预则自动关机。
 //!
 //! 模块划分：
@@ -24,8 +24,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod assets;
 mod autostart;
 mod countdown;
+mod config;
 mod events;
 mod logger;
 mod monitor;
@@ -95,7 +97,9 @@ fn main() {
     // 命令通道：UI -> 心跳监控线程
     let (cmd_tx, cmd_rx) = futures::channel::mpsc::unbounded::<MonitorCommand>();
 
-    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    let settings = config::Settings::load();
+    crate::log_info!("关机策略：失联 {} 秒，倒计时 {} 秒", settings.heartbeat_timeout_seconds, settings.countdown_seconds);
+    let app = gpui_kit::application().with_assets(assets::AppAssets);
     app.run(move |cx| {
         gpui_kit::init(cx);
 
@@ -106,10 +110,10 @@ fn main() {
         tray::create_tray(event_tx.clone());
 
         // 启动心跳监控线程（内部自带 tokio runtime）
-        monitor::spawn(cmd_rx, event_tx.clone());
+        monitor::spawn(cmd_rx, event_tx.clone(), settings);
 
         cx.spawn(async move |cx| {
-            // 计算主窗口初始位置（屏幕居中，高度与最小高度一致，紧凑显示）
+            // 屏幕居中；配置默认收起，展开后可滚动查看。
             let bounds = cx.update(|cx| WindowBounds::centered(size(px(560.), px(430.)), cx));
 
             // AppModel 实体通过槽位从窗口构建闭包里带出来：
@@ -123,7 +127,7 @@ fn main() {
                     main_window_options(Some(bounds), silent_start),
                     |window, cx| {
                         let model = cx
-                            .new(|cx| AppModel::new(event_tx.clone(), cmd_tx.clone(), window, cx));
+                            .new(|cx| AppModel::new(event_tx.clone(), cmd_tx.clone(), settings, window, cx));
                         *slot_for_closure.borrow_mut() = Some(model.clone());
                         // 第一层视图必须是 Root
                         let view: gpui_kit::AnyView = model.into();
